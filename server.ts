@@ -59,6 +59,8 @@ const AUTHENTIC_SONGS: Record<string, { query: string; directUrl: string }> = {
 
 // Initialize Google GenAI
 const apiKey = process.env.GEMINI_API_KEY || '';
+const DEFAULT_HOST_VOICE = 'Kore';
+const DEFAULT_HOST_STYLE = 'A real person speaking naturally and warmly in an American conversational voice. Sound like a quick-witted, confident live game-show host talking to friends in the same room: relaxed breath, varied pitch and rhythm, crisp but unforced diction, subtle humor, and genuine reactions. Keep the energy lively but never shout, over-enunciate, or sound like a commercial or a synthetic announcer.';
 let ai: GoogleGenAI | null = null;
 if (apiKey) {
   ai = new GoogleGenAI({
@@ -69,6 +71,30 @@ if (apiKey) {
       },
     },
   });
+}
+
+async function generateSpeechAudio(
+  text: string,
+  style: string = DEFAULT_HOST_STYLE,
+  voice: string = DEFAULT_HOST_VOICE
+): Promise<string | undefined> {
+  if (!ai) return undefined;
+
+  const interaction = await ai.interactions.create({
+    model: 'gemini-3.8-flash-tts',
+    input: [{
+      type: 'user_input',
+      content: [{
+        type: 'text',
+        text,
+        annotations: [{ type: 'speech_metadata', style }],
+      }],
+    }],
+    response_format: { type: 'audio', mime_type: 'audio/wav', delivery: 'inline' },
+    generation_config: { speech_config: [{ voice }] },
+  });
+
+  return interaction.output_audio?.data;
 }
 
 // Health check endpoint
@@ -124,16 +150,19 @@ app.get('/api/song-clip/:songKey', async (req: Request, res: Response) => {
 });
 
 /**
- * Endpoint: Generate authentic human speech using Gemini 3.8 Flash Lite TTS
+ * Endpoint: Generate natural-sounding host speech using Gemini 3.8 Flash TTS
  * Returns base64 encoded audio/wav
  */
 app.post('/api/host-speak', async (req: Request, res: Response) => {
-  const { text, voice = 'Puck', speechStyle } = req.body;
-  if (!text || typeof text !== 'string') {
-    return res.status(400).json({ error: 'Text is required' });
+  const { text, voice = DEFAULT_HOST_VOICE, speechStyle = DEFAULT_HOST_STYLE } = req.body;
+  if (typeof text !== 'string' || !text.trim() || text.length > 1000) {
+    return res.status(400).json({ error: 'Text must contain between 1 and 1000 characters' });
+  }
+  if (typeof voice !== 'string' || voice.length > 64 || typeof speechStyle !== 'string' || speechStyle.length > 500) {
+    return res.status(400).json({ error: 'Invalid voice settings' });
   }
 
-  const cacheKey = `${voice}_${speechStyle || ''}_${text.trim().toLowerCase()}`;
+  const cacheKey = `${voice}_${speechStyle}_${text.trim().toLowerCase()}`;
   if (ttsAudioCache.has(cacheKey)) {
     return res.json({ audioBase64: ttsAudioCache.get(cacheKey), cached: true });
   }
@@ -143,25 +172,7 @@ app.post('/api/host-speak', async (req: Request, res: Response) => {
   }
 
   try {
-    const parts: any[] = [{ text: text.trim() }];
-    if (speechStyle) {
-      parts[0].speechMetadata = { style: speechStyle };
-    }
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash-lite-tts',
-      contents: [{ role: 'user', parts }],
-      config: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: voice },
-          },
-        },
-      },
-    });
-
-    const audioBase64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    const audioBase64 = await generateSpeechAudio(text.trim(), speechStyle, voice);
     if (audioBase64) {
       // Cache audio for repeated game loops
       if (ttsAudioCache.size > 200) {
@@ -172,7 +183,7 @@ app.post('/api/host-speak', async (req: Request, res: Response) => {
       return res.json({ audioBase64, cached: false });
     }
 
-    res.status(500).json({ error: 'No audio generated' });
+    res.status(502).json({ error: 'The speech model returned no audio' });
   } catch (err: any) {
     console.error('Error generating host TTS:', err);
     res.status(500).json({ error: err.message || 'TTS generation failed' });
@@ -232,32 +243,13 @@ app.post('/api/character-quote', async (req: Request, res: Response) => {
         style = 'Authentic dramatic 80s movie dialogue';
     }
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash-lite-tts',
-      contents: [{
-        role: 'user',
-        parts: [{
-          text: text.trim(),
-          speechMetadata: { style }
-        }]
-      }],
-      config: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: voice },
-          },
-        },
-      },
-    });
-
-    const audioBase64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    const audioBase64 = await generateSpeechAudio(text.trim(), style, voice);
     if (audioBase64) {
       quoteAudioCache.set(cacheKey, audioBase64);
       return res.json({ audioBase64, cached: false });
     }
 
-    res.status(500).json({ error: 'No audio generated' });
+    res.status(502).json({ error: 'The speech model returned no audio' });
   } catch (err: any) {
     console.error('Error generating character quote:', err);
     res.status(500).json({ error: err.message || 'Quote generation failed' });
@@ -324,25 +316,13 @@ Return valid JSON strictly matching this schema:
     const parsed = JSON.parse(response.text || '{}');
     const hostReplyText = parsed.hostReplyText || "Alright, let's keep the 80s moving!";
 
-    // Automatically generate authentic Puck TTS voice for the reply
+    // Generate the host reply with the same conversational voice as scripted lines.
     let audioBase64: string | undefined;
     try {
-      const ttsRes = await ai.models.generateContent({
-        model: 'gemini-3.8-flash-lite-tts',
-        contents: [{
-          role: 'user',
-          parts: [{ text: hostReplyText }]
-        }],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: 'Puck' },
-            },
-          },
-        },
-      });
-      audioBase64 = ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      audioBase64 = await generateSpeechAudio(
+        hostReplyText,
+        `${DEFAULT_HOST_STYLE} ${typeof parsed.speechStyle === 'string' ? parsed.speechStyle : ''}`.trim()
+      );
     } catch (ttsErr) {
       console.warn('TTS inside converse failed, falling back to text:', ttsErr);
     }
@@ -394,29 +374,14 @@ Plain text only. No markdown, no stage directions.`;
     // Generate authentic voice audio for the roast
     let audioBase64: string | undefined;
     try {
-      const ttsRes = await ai.models.generateContent({
-        model: 'gemini-3.8-flash-lite-tts',
-        contents: [{
-          role: 'user',
-          parts: [{
-            text: roast,
-            speechMetadata: {
-              style: isCorrect ? 'Proud sarcastic comedic host' : 'Mocking sarcastic laughing game show host'
-            }
-          }]
-        }],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: 'Puck' },
-            },
-          },
-        },
-      });
-      audioBase64 = ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    } catch {
-      // Audio optional
+      audioBase64 = await generateSpeechAudio(
+        roast,
+        isCorrect
+          ? `${DEFAULT_HOST_STYLE} React with genuine delight and a teasing smile.`
+          : `${DEFAULT_HOST_STYLE} React with dry, playful disappointment, never cruel or exaggerated.`
+      );
+    } catch (ttsError) {
+      console.warn('TTS for host roast failed; returning text only:', ttsError);
     }
 
     res.json({ roast, audioBase64 });

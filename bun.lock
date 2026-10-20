@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "react-example",
+      "name": "ai-party-host",
       "dependencies": {
         "@google/genai": "^2.4.0",
         "@tailwindcss/vite": "^4.3.3",
@@ -24,7 +24,6 @@
         "@types/react": "^19.3.0",
         "@types/react-dom": "^19.3.0",
         "autoprefixer": "^10.4.21",
-        "esbuild": "^0.25.0",
         "tailwindcss": "^4.3.3",
         "tsx": "^4.21.0",
         "typescript": "^7.0.2",

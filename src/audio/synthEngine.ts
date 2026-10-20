@@ -1,3 +1,5 @@
+import { voiceBuzzer } from '../speech/voiceBuzzer.ts';
+
 // Studio-Grade 80s Polyphonic Audio Engine (Multi-Track Drum Machines, FM Slap Bass, Polyphonic Chords & Studio FX)
 
 class StudioAudioEngine {
@@ -297,16 +299,15 @@ class StudioAudioEngine {
   private songMediaNode: MediaElementAudioSourceNode | null = null;
 
   public stopCurrentClip() {
-    if (this.currentSongAudio) {
-      try {
-        this.currentSongAudio.pause();
-        this.currentSongAudio.currentTime = 0;
-      } catch {}
-      this.currentSongAudio = null;
-    }
     if (this.currentClipStopFn) {
-      this.currentClipStopFn();
+      const stopClip = this.currentClipStopFn;
       this.currentClipStopFn = null;
+      stopClip();
+    } else if (this.currentSongAudio) {
+      this.currentSongAudio.pause();
+      this.currentSongAudio.currentTime = 0;
+      this.currentSongAudio = null;
+      voiceBuzzer.setPlaybackSuppressed('song-clip', false);
     }
   }
 
@@ -319,9 +320,9 @@ class StudioAudioEngine {
       if (onEnd) onEnd();
       return;
     }
-    this.init();
-
+    voiceBuzzer.setPlaybackSuppressed('song-clip', true);
     try {
+      this.init();
       const audio = new Audio(`/api/song-clip/${encodeURIComponent(songKey)}`);
       audio.crossOrigin = 'anonymous';
       this.currentSongAudio = audio;
@@ -337,40 +338,37 @@ class StudioAudioEngine {
       }
 
       // 12-second clip limit for trivia pacing
-      const clipTimeout = window.setTimeout(() => {
-        this.stopCurrentClip();
+      let finished = false;
+      let clipTimeout: number;
+      const finish = (stopAudio = false) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(clipTimeout);
+        if (stopAudio) audio.pause();
+        if (this.currentSongAudio === audio) this.currentSongAudio = null;
+        this.currentClipStopFn = null;
+        voiceBuzzer.setPlaybackSuppressed('song-clip', false);
         if (onEnd) onEnd();
-      }, 12000);
+      };
+      clipTimeout = window.setTimeout(() => finish(true), 12000);
 
       audio.onended = () => {
-        clearTimeout(clipTimeout);
-        this.currentSongAudio = null;
-        if (onEnd) onEnd();
+        finish();
       };
 
       audio.onerror = (err) => {
-        clearTimeout(clipTimeout);
         console.warn('Song clip playback error:', err);
-        this.currentSongAudio = null;
-        if (onEnd) onEnd();
+        finish();
       };
 
-      this.currentClipStopFn = () => {
-        clearTimeout(clipTimeout);
-        if (this.currentSongAudio) {
-          try {
-            this.currentSongAudio.pause();
-          } catch {}
-          this.currentSongAudio = null;
-        }
-      };
+      this.currentClipStopFn = () => finish(true);
 
       audio.play().catch((err) => {
         console.warn('Audio play prevented by browser:', err);
-        clearTimeout(clipTimeout);
-        if (onEnd) onEnd();
+        finish();
       });
     } catch (err) {
+      voiceBuzzer.setPlaybackSuppressed('song-clip', false);
       console.error('Failed to initiate song clip:', err);
       if (onEnd) onEnd();
     }

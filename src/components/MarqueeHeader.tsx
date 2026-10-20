@@ -50,7 +50,7 @@ export const MarqueeHeader: React.FC<MarqueeHeaderProps> = ({
   };
 
   const toggleVoice = () => {
-    if (voiceState.isListening) {
+    if (voiceState.isEnabled) {
       voiceBuzzer.stop();
     } else {
       voiceBuzzer.start();
@@ -81,17 +81,19 @@ export const MarqueeHeader: React.FC<MarqueeHeaderProps> = ({
           <button
             onClick={toggleVoice}
             className={`flex items-center gap-1.5 px-2.5 py-1 rounded transition-colors ${
-              voiceState.isListening
+              voiceState.isEnabled
                 ? 'bg-emerald-950/80 text-emerald-300 border border-emerald-500/50'
                 : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
             }`}
             title={voiceState.isSupported ? 'Toggle Voice Recognition Buzzer' : 'Voice not supported in this browser'}
           >
-            {voiceState.isListening ? (
+            {voiceState.isEnabled ? (
               <>
                 <Mic className="w-3.5 h-3.5 text-emerald-400 animate-bounce" />
-                <span className="hidden md:inline font-semibold">VOICE BUZZER ACTIVE</span>
-                <span className="md:hidden font-semibold">MIC ON</span>
+                <span className="hidden md:inline font-semibold">
+                  {voiceState.isPlaybackSuppressed ? 'MIC PAUSED FOR AUDIO' : 'VOICE BUZZER ACTIVE'}
+                </span>
+                <span className="md:hidden font-semibold">{voiceState.isPlaybackSuppressed ? 'MIC PAUSED' : 'MIC ON'}</span>
               </>
             ) : (
               <>

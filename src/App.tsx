@@ -98,7 +98,7 @@ export default function App() {
 
   const playQuestionIntroAndAudio = (q: Question) => {
     host.speak(q.hostIntroCommentary, {
-      voice: 'Puck',
+      voice: 'Kore',
       onEnd: () => {
         if (q.type === 'SONG_CLIP' && q.audioClipKey) {
           setIsPlayingAudio(true);
@@ -196,7 +196,7 @@ export default function App() {
     if (buzzedPlayer) {
       setPlayers(prev => prev.map(p => p.id === playerId ? { ...p, buzzCount: p.buzzCount + 1 } : p));
       host.speak(`${buzzedPlayer.name} buzzed in! Speak your answer now! Five seconds!`, {
-        voice: 'Puck',
+        voice: 'Kore',
         interrupt: true,
       });
     }
@@ -262,14 +262,14 @@ export default function App() {
       });
       setHostRoastText(roastText);
       if (audioBase64) {
-        host.playAudioWav(audioBase64);
+        host.playAudioWav(audioBase64, undefined, roastText);
       } else {
-        host.speak(roastText, { voice: 'Puck' });
+        host.speak(roastText, { voice: 'Kore' });
       }
     } catch {
       const fallback = isCorrect ? currentQuestion.hostCorrectRoast : currentQuestion.hostWrongRoast;
       setHostRoastText(fallback);
-      host.speak(fallback, { voice: 'Puck' });
+      host.speak(fallback, { voice: 'Kore' });
     }
   }, [gameState, activeBuzzerPlayerId, currentQuestion, currentPoints, players, lockedOutPlayerIds]);
 
@@ -295,12 +295,12 @@ export default function App() {
       setGameState('ANSWER_REVEAL');
       const roast = `Time expired on ${buzzedPlayer?.name || 'player'}! And nobody else can buzz. Tragic.`;
       setHostRoastText(roast);
-      host.speak(roast, { voice: 'Puck' });
+      host.speak(roast, { voice: 'Kore' });
     } else {
       setActiveBuzzerPlayerId(null);
       setGameState('QUESTION_ACTIVE');
       host.speak(`Time's up for ${buzzedPlayer?.name}! The floor is open! Anyone shout your name to buzz in!`, {
-        voice: 'Puck',
+        voice: 'Kore',
         interrupt: true,
       });
     }
@@ -315,7 +315,7 @@ export default function App() {
     setGameState('ANSWER_REVEAL');
     const roast = `Tick tock! Time ran out, and nobody buzzed in. Were you all busy untangling your cassette tapes?!`;
     setHostRoastText(roast);
-    host.speak(roast, { voice: 'Puck' });
+    host.speak(roast, { voice: 'Kore' });
   };
 
   // Screw Mechanics
@@ -323,7 +323,7 @@ export default function App() {
     setIsScrewTargeting(true);
     setScrewerId(screwer);
     synth.playScrewStab();
-    host.speak("Someone's feeling ruthless! Shout who you want to screw!", { voice: 'Puck', interrupt: true });
+    host.speak("Someone's feeling ruthless! Shout who you want to screw!", { voice: 'Kore', interrupt: true });
   };
 
   const handleSelectScrewTarget = (targetId: string) => {
@@ -340,7 +340,7 @@ export default function App() {
 
     synth.playScrewStab();
     host.speak(`OH SNAP! ${screwer?.name} just SCREWED ${target?.name}! You have five seconds to answer or lose cash!`, {
-      voice: 'Puck',
+      voice: 'Kore',
       interrupt: true,
     });
 
@@ -504,9 +504,9 @@ export default function App() {
 
         // Play host reply audio if generated
         if (result.audioBase64) {
-          host.playAudioWav(result.audioBase64);
+          host.playAudioWav(result.audioBase64, undefined, result.hostReplyText);
         } else if (result.hostReplyText) {
-          host.speak(result.hostReplyText, { voice: 'Puck' });
+          host.speak(result.hostReplyText, { voice: 'Kore' });
         }
       }
     } finally {

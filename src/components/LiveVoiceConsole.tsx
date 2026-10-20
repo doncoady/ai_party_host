@@ -26,7 +26,7 @@ export const LiveVoiceConsole: React.FC<LiveVoiceConsoleProps> = ({
   }, []);
 
   const handleToggleMic = () => {
-    if (voiceState.isListening) {
+    if (voiceState.isEnabled) {
       voiceBuzzer.stop();
     } else {
       voiceBuzzer.start();
@@ -50,15 +50,15 @@ export const LiveVoiceConsole: React.FC<LiveVoiceConsoleProps> = ({
           <button
             onClick={handleToggleMic}
             className={`p-2.5 rounded-full transition-all cursor-pointer flex items-center justify-center shrink-0 ${
-              voiceState.isListening
+              voiceState.isEnabled
                 ? voiceState.isSpeaking
                   ? 'bg-rose-600 text-white shadow-lg shadow-rose-600/50 scale-110 ring-4 ring-rose-400 animate-pulse'
                   : 'bg-emerald-600 text-white shadow-md shadow-emerald-600/30 ring-2 ring-emerald-400'
                 : 'bg-slate-800 text-slate-400 hover:text-white'
             }`}
-            title={voiceState.isListening ? 'Microphone Active — Click to pause' : 'Click to Enable Microphone'}
+            title={voiceState.isEnabled ? 'Microphone enabled — Click to pause' : 'Click to Enable Microphone'}
           >
-            {voiceState.isListening ? (
+            {voiceState.isEnabled ? (
               <Mic className={`w-5 h-5 ${voiceState.isSpeaking ? 'animate-bounce' : ''}`} />
             ) : (
               <MicOff className="w-5 h-5" />
@@ -68,7 +68,15 @@ export const LiveVoiceConsole: React.FC<LiveVoiceConsoleProps> = ({
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <span className="font-arcade text-xs tracking-wider text-emerald-400">
-                {voiceState.isSpeaking ? 'LISTENING TO ROOM...' : voiceState.isListening ? 'VOICE READY (HANDS-FREE)' : 'MIC MUTED'}
+                {voiceState.isPlaybackSuppressed
+                  ? 'HOST AUDIO · MIC PAUSED'
+                  : voiceState.isSpeaking
+                  ? 'LISTENING TO ROOM...'
+                  : voiceState.isEnabled
+                  ? 'VOICE READY (HANDS-FREE)'
+                  : voiceState.isSupported
+                  ? 'MIC MUTED'
+                  : 'VOICE NOT SUPPORTED'}
               </span>
               {activePlayerBuzzedName && (
                 <span className="px-2 py-0.5 rounded bg-rose-950 text-rose-300 font-arcade text-[10px] border border-rose-500/40 animate-pulse">
@@ -79,7 +87,9 @@ export const LiveVoiceConsole: React.FC<LiveVoiceConsoleProps> = ({
 
             {/* Live Transcript Display */}
             <div className="text-xs text-slate-300 font-sans-retro truncate max-w-md">
-              {voiceState.lastTranscript ? (
+              {voiceState.errorMessage ? (
+                <span className="text-rose-300">Voice input error: {voiceState.errorMessage}</span>
+              ) : voiceState.lastTranscript ? (
                 <span>
                   Heard: <strong className="text-yellow-300 font-semibold">"{voiceState.lastTranscript}"</strong>
                 </span>
