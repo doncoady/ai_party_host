@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+@layer utilities {
+  .font-arcade {
+    font-family: 'Bungee', cursive, sans-serif;
+  }
+  .font-pixel {
+    font-family: 'VT323', monospace;
+  }
+  .font-sans-retro {
+    font-family: 'Outfit', sans-serif;
+  }
+
+  .neon-glow-pink {
+    text-shadow: 0 0 5px #ec4899, 0 0 15px #ec4899, 0 0 30px #db2777;
+  }
+  .neon-glow-cyan {
+    text-shadow: 0 0 5px #06b6d4, 0 0 15px #06b6d4, 0 0 30px #0891b2;
+  }
+  .neon-glow-yellow {
+    text-shadow: 0 0 5px #eab308, 0 0 15px #eab308, 0 0 30px #ca8a04;
+  }
+  .neon-box-pink {
+    box-shadow: 0 0 15px rgba(236, 72, 153, 0.4), inset 0 0 15px rgba(236, 72, 153, 0.2);
+  }
+  .neon-box-cyan {
+    box-shadow: 0 0 15px rgba(6, 182, 212, 0.4), inset 0 0 15px rgba(6, 182, 212, 0.2);
+  }
+  .crt-scanlines {
+    background: linear-gradient(
+      rgba(18, 16, 16, 0) 50%, 
+      rgba(0, 0, 0, 0.35) 50%
+    );
+    background-size: 100% 4px;
+    pointer-events: none;
+  }
+}
+
+/* Custom scrollbars and styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #090d16;
+}
+::-webkit-scrollbar-thumb {
+  background: #ec4899;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #f43f5e;
+}
