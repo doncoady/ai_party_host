@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { Volume2, VolumeX, Mic, MicOff, Music, Radio, Sparkles } from 'lucide-react';
-import { synth } from '../audio/synthEngine.ts';
+import { media } from '../audio/mediaEngine.ts';
 import { host } from '../audio/speechHost.ts';
-import { voiceBuzzer, VoiceRecognitionState } from '../speech/voiceBuzzer.ts';
+import { liveVoice, LiveVoiceState } from '../speech/liveVoice.ts';
 
 interface MarqueeHeaderProps {
   currentRoundName?: string;
@@ -15,24 +15,24 @@ export const MarqueeHeader: React.FC<MarqueeHeaderProps> = ({
   questionNumber = 1,
   totalQuestions = 8,
 }) => {
-  const [isMuted, setIsMuted] = useState(synth.getMuted());
-  const [isBgmOn, setIsBgmOn] = useState(synth.getBgmStatus());
-  const [voiceState, setVoiceState] = useState<VoiceRecognitionState>(voiceBuzzer.getState());
+  const [isMuted, setIsMuted] = useState(media.getMuted());
+  const [isBgmOn, setIsBgmOn] = useState(media.getBackgroundMusicStatus());
+  const [voiceState, setVoiceState] = useState<LiveVoiceState>(liveVoice.getState());
   const [hostSubtitle, setHostSubtitle] = useState<string>('');
-  const [isHostSpeaking, setIsHostSpeaking] = useState<boolean>(false);
 
   useEffect(() => {
-    const unsubVoice = voiceBuzzer.subscribe((state) => {
+    const unsubVoice = liveVoice.subscribe((state) => {
       setVoiceState(state);
     });
 
-    const unsubHost = host.subscribe((subtitle, speaking) => {
+    const unsubMusic = media.subscribeBackgroundMusic(setIsBgmOn);
+    const unsubHost = host.subscribe((subtitle) => {
       setHostSubtitle(subtitle);
-      setIsHostSpeaking(speaking);
     });
 
     return () => {
       unsubVoice();
+      unsubMusic();
       unsubHost();
     };
   }, []);
@@ -40,20 +40,21 @@ export const MarqueeHeader: React.FC<MarqueeHeaderProps> = ({
   const toggleMute = () => {
     const next = !isMuted;
     setIsMuted(next);
-    synth.setMuted(next);
+    media.setMuted(next);
+    liveVoice.setMuted(next);
     host.setMuted(next);
   };
 
-  const toggleBgm = () => {
-    synth.toggleBgm();
-    setIsBgmOn(synth.getBgmStatus());
+  const toggleBgm = async () => {
+    await media.toggleBackgroundMusic();
+    setIsBgmOn(media.getBackgroundMusicStatus());
   };
 
   const toggleVoice = () => {
     if (voiceState.isEnabled) {
-      voiceBuzzer.stop();
+      liveVoice.stop();
     } else {
-      voiceBuzzer.start();
+      void liveVoice.start();
     }
   };
 
@@ -77,7 +78,7 @@ export const MarqueeHeader: React.FC<MarqueeHeaderProps> = ({
 
         {/* Audio & Voice controls */}
         <div className="flex items-center gap-2 sm:gap-3">
-          {/* Voice Buzzer status */}
+          {/* Live voice status */}
           <button
             onClick={toggleVoice}
             className={`flex items-center gap-1.5 px-2.5 py-1 rounded transition-colors ${
@@ -85,37 +86,37 @@ export const MarqueeHeader: React.FC<MarqueeHeaderProps> = ({
                 ? 'bg-emerald-950/80 text-emerald-300 border border-emerald-500/50'
                 : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
             }`}
-            title={voiceState.isSupported ? 'Toggle Voice Recognition Buzzer' : 'Voice not supported in this browser'}
+            title={voiceState.isSupported ? 'Toggle Gemini Live voice' : 'Live voice not supported in this browser'}
           >
             {voiceState.isEnabled ? (
               <>
                 <Mic className="w-3.5 h-3.5 text-emerald-400 animate-bounce" />
                 <span className="hidden md:inline font-semibold">
-                  {voiceState.isPlaybackSuppressed ? 'MIC PAUSED FOR AUDIO' : 'VOICE BUZZER ACTIVE'}
+                  {voiceState.isPlaybackSuppressed ? 'MIC PAUSED FOR AUDIO' : voiceState.isOutputting ? 'LIVE HOST SPEAKING' : voiceState.isListening ? 'LIVE VOICE ON' : 'CONNECTING...'}
                 </span>
-                <span className="md:hidden font-semibold">{voiceState.isPlaybackSuppressed ? 'MIC PAUSED' : 'MIC ON'}</span>
+                <span className="md:hidden font-semibold">{voiceState.isPlaybackSuppressed ? 'MIC PAUSED' : voiceState.isOutputting ? 'HOST LIVE' : voiceState.isListening ? 'MIC ON' : 'CONNECTING'}</span>
               </>
             ) : (
               <>
                 <MicOff className="w-3.5 h-3.5 text-slate-500" />
-                <span className="hidden md:inline">VOICE BUZZER OFF</span>
+                <span className="hidden md:inline">VOICE INPUT OFF</span>
                 <span className="md:hidden">MIC OFF</span>
               </>
             )}
           </button>
 
-          {/* Synth BGM Toggle */}
+          {/* Background Music Toggle */}
           <button
-            onClick={toggleBgm}
+            onClick={() => void toggleBgm()}
             className={`flex items-center gap-1 px-2 py-1 rounded transition-colors ${
               isBgmOn 
                 ? 'bg-cyan-950/80 text-cyan-300 border border-cyan-500/50' 
                 : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
             }`}
-            title="Toggle 80s Synth BGM"
+            title="Toggle background music"
           >
             <Music className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">SYNTH BGM</span>
+            <span className="hidden sm:inline">MUSIC</span>
           </button>
 
           {/* Master Audio Mute */}
@@ -139,7 +140,7 @@ export const MarqueeHeader: React.FC<MarqueeHeaderProps> = ({
               <span>HOST</span>
             </div>
             <p className="text-sm md:text-base font-sans-retro text-yellow-300 font-semibold tracking-wide drop-shadow truncate">
-              "{hostSubtitle}"
+              "{voiceState.outputTranscript || hostSubtitle}"
             </p>
           </div>
         </div>

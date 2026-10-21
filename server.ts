@@ -1,9 +1,11 @@
 import express, { Request, Response } from 'express';
+import { createServer } from 'node:http';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, Modality } from '@google/genai';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { WebSocket, WebSocketServer } from 'ws';
 
 dotenv.config();
 
@@ -11,6 +13,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+const server = createServer(app);
+const liveWebSocketServer = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 });
 const port = process.env.PORT || 3000;
 const isProduction = process.env.NODE_ENV === 'production';
 
@@ -60,7 +64,8 @@ const AUTHENTIC_SONGS: Record<string, { query: string; directUrl: string }> = {
 // Initialize Google GenAI
 const apiKey = process.env.GEMINI_API_KEY || '';
 const DEFAULT_HOST_VOICE = 'Kore';
-const DEFAULT_HOST_STYLE = 'A real person speaking naturally and warmly in an American conversational voice. Sound like a quick-witted, confident live game-show host talking to friends in the same room: relaxed breath, varied pitch and rhythm, crisp but unforced diction, subtle humor, and genuine reactions. Keep the energy lively but never shout, over-enunciate, or sound like a commercial or a synthetic announcer.';
+const LIVE_HOST_MODEL = process.env.GEMINI_LIVE_MODEL || 'gemini-3.8-live';
+const DEFAULT_HOST_STYLE = 'A quick-witted, funny, sarcastic American game-show host talking to friends in the same room. Use dry punchlines, brisk pacing, varied pitch, crisp natural diction, and playful confidence. Tease the game, never the players personally; do not shout or sound like a commercial.';
 let ai: GoogleGenAI | null = null;
 if (apiKey) {
   ai = new GoogleGenAI({
@@ -90,16 +95,88 @@ async function generateSpeechAudio(
         annotations: [{ type: 'speech_metadata', style }],
       }],
     }],
-    response_format: { type: 'audio', mime_type: 'audio/wav', delivery: 'inline' },
+    response_format: { type: 'audio' },
     generation_config: { speech_config: [{ voice }] },
   });
 
   return interaction.output_audio?.data;
 }
 
+function sendSongClip(req: Request, res: Response, buffer: Buffer, contentType: string) {
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  res.setHeader('Accept-Ranges', 'bytes');
+
+  const ranges = req.range(buffer.length);
+  if (ranges === -1) {
+    res.setHeader('Content-Range', `bytes */${buffer.length}`);
+    res.status(416).end();
+    return;
+  }
+
+  if (Array.isArray(ranges) && ranges.length === 1) {
+    const { start, end } = ranges[0];
+    const partial = buffer.subarray(start, end + 1);
+    res.status(206);
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${buffer.length}`);
+    res.setHeader('Content-Length', partial.length);
+    res.end(partial);
+    return;
+  }
+
+  res.setHeader('Content-Length', buffer.length);
+  res.end(buffer);
+}
+
 // Health check endpoint
 app.get('/api/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', hasApiKey: !!apiKey });
+});
+
+app.post('/api/host-narrate', async (req: Request, res: Response) => {
+  const { isOpening, question, players } = req.body;
+  if (
+    typeof isOpening !== 'boolean' ||
+    !question ||
+    typeof question.category !== 'string' ||
+    typeof question.title !== 'string' ||
+    typeof question.question !== 'string' ||
+    typeof question.explanation !== 'string' ||
+    !Array.isArray(players) ||
+    players.length > 4 ||
+    players.some(player => typeof player.name !== 'string' || typeof player.score !== 'number')
+  ) {
+    return res.status(400).json({ error: 'Invalid narration request' });
+  }
+
+  if (!ai) return res.status(503).json({ error: 'AI narration unavailable' });
+
+  try {
+    const roster = players.map(player => `${player.name}: $${player.score}`).join(', ');
+    const prompt = `Write an original spoken introduction for a live 1980s trivia party-game host.
+${isOpening
+    ? `Welcome the players (${roster}) to the show and build anticipation for their first category, "${question.category}".`
+    : `Introduce the next question in "${question.category}" (${question.title}). Current standings: ${roster}. React naturally to the game so far.`}
+
+Be vivid, conversational, funny, and narrative, like a confident human host talking to friends in a room. Use 2 or 3 short sentences, no more than 45 words. Do not reveal the answer or add facts beyond this context. The game will read the question itself immediately after your intro.
+Question: ${question.question}
+Verified context: ${question.explanation}
+Return only the spoken intro, with no labels or stage directions.`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash',
+      contents: prompt,
+    });
+    const intro = response.text?.trim();
+    if (!intro) return res.status(502).json({ error: 'The host returned no narration' });
+
+    const text = `${intro} ${question.question}`;
+    const audioBase64 = await generateSpeechAudio(text);
+    res.json({ text, audioBase64 });
+  } catch (err) {
+    console.error('Error generating host narration:', err);
+    res.status(502).json({ error: 'Could not generate host narration' });
+  }
 });
 
 /**
@@ -111,9 +188,7 @@ app.get('/api/song-clip/:songKey', async (req: Request, res: Response) => {
 
   if (songClipBufferCache.has(songKey)) {
     const cached = songClipBufferCache.get(songKey)!;
-    res.setHeader('Content-Type', cached.contentType);
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    return res.send(cached.buffer);
+    return sendSongClip(req, res, cached.buffer, cached.contentType);
   }
 
   try {
@@ -136,13 +211,14 @@ app.get('/api/song-clip/:songKey', async (req: Request, res: Response) => {
 
     const arrayBuf = await audioRes.arrayBuffer();
     const buffer = Buffer.from(arrayBuf);
-    const contentType = audioRes.headers.get('content-type') || 'audio/mp4';
+    const upstreamContentType = audioRes.headers.get('content-type');
+    const contentType = upstreamContentType === 'audio/x-m4p'
+      ? 'audio/mp4'
+      : upstreamContentType || 'audio/mp4';
 
     songClipBufferCache.set(songKey, { buffer, contentType });
 
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.send(buffer);
+    sendSongClip(req, res, buffer, contentType);
   } catch (err: any) {
     console.error('Error streaming authentic song clip:', err);
     res.status(500).send('Failed to stream song clip');
@@ -256,93 +332,12 @@ app.post('/api/character-quote', async (req: Request, res: Response) => {
   }
 });
 
-/**
- * Endpoint: Live Voice Interaction & Banter with the AI Host
- * Players talk live into the microphone!
- * The AI Host analyzes the intent, executes game actions (BUZZ, ANSWER, SCREW, NEXT),
- * and generates authentic sarcastic speech back to the players.
- */
-app.post('/api/host-converse', async (req: Request, res: Response) => {
-  const { transcript, gameState, players, currentQuestion, activeBuzzerPlayerId } = req.body;
-
-  if (!transcript || typeof transcript !== 'string') {
-    return res.status(400).json({ error: 'Transcript required' });
-  }
-
-  if (!ai) {
-    return res.json({
-      intent: 'BANTER',
-      hostReplyText: `I heard you, but my AI circuits are resting. Keep playing!`,
-    });
-  }
-
-  try {
-    const prompt = `You are the witty, razor-sharp, sarcastic host of a live 80s party game show called "YOU DON'T KNOW 80s!".
-The live players in the living room just spoke to you via their microphone:
-Player Voice Input: "${transcript}"
-
-Current Game State: ${gameState}
-Current Question: ${currentQuestion ? `"${currentQuestion.question}"` : 'None'}
-Options: ${currentQuestion ? JSON.stringify(currentQuestion.options) : 'None'}
-Active Buzzer Player: ${activeBuzzerPlayerId || 'None'}
-Players in Room: ${JSON.stringify(players.map((p: any) => ({ id: p.id, name: p.name, score: p.score })))}
-
-Analyze what the player in the room is trying to do:
-1. BUZZ: Did someone try to buzz in? (e.g. saying their name like "Nancy", "Rick", "I'm in", "Buzz", "Player 1")
-2. ANSWER: If a player is buzzed in (or trying to answer), did they say an answer or option number? (e.g. "Ferris Bueller", "A-ha", "Choice B", "Option 1")
-3. SCREW: Did someone say "Screw Rick" or "Screw Nancy" or "Use my screw"?
-4. START_GAME: In the lobby, did someone say "Start game", "Let's play", "Go"?
-5. NEXT_QUESTION: Did someone say "Next question", "Keep going", "Let's move on"?
-6. BANTER: Are they talking to you, joking, asking a question, complaining, or asking for a hint?
-
-Return valid JSON strictly matching this schema:
-{
-  "intent": "BUZZ" | "ANSWER" | "SCREW" | "START_GAME" | "NEXT_QUESTION" | "BANTER",
-  "playerId": string or null (if intent is BUZZ or player identified),
-  "optionIndex": number or null (0-3 if intent is ANSWER),
-  "targetPlayerId": string or null (if intent is SCREW),
-  "hostReplyText": string (hilarious, sarcastic 1-2 sentence spoken reply, max 30 words. Plain text only, no markdown or asterisks),
-  "speechStyle": string (e.g. "Sarcastic punchy game show host" or "Mocking comedic tease")
-}`;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-      },
-    });
-
-    const parsed = JSON.parse(response.text || '{}');
-    const hostReplyText = parsed.hostReplyText || "Alright, let's keep the 80s moving!";
-
-    // Generate the host reply with the same conversational voice as scripted lines.
-    let audioBase64: string | undefined;
-    try {
-      audioBase64 = await generateSpeechAudio(
-        hostReplyText,
-        `${DEFAULT_HOST_STYLE} ${typeof parsed.speechStyle === 'string' ? parsed.speechStyle : ''}`.trim()
-      );
-    } catch (ttsErr) {
-      console.warn('TTS inside converse failed, falling back to text:', ttsErr);
-    }
-
-    res.json({
-      ...parsed,
-      audioBase64,
-    });
-  } catch (err: any) {
-    console.error('Error in host-converse:', err);
-    res.json({
-      intent: 'BANTER',
-      hostReplyText: "I heard ya! Let's get back to the trivia before my hairspray wears off.",
-    });
-  }
-});
-
-// Endpoint: Dynamic YDKJ AI Host Roast & Commentary (with authentic audio)
+// Endpoint: Dynamic host answer commentary with generated audio
 app.post('/api/host-roast', async (req: Request, res: Response) => {
-  const { playerName, score, questionText, chosenAnswer, isCorrect, correctAnswer } = req.body;
+  const { playerName, score, questionText, chosenAnswer, isCorrect, correctAnswer, useLiveHost } = req.body;
+  if (useLiveHost !== undefined && typeof useLiveHost !== 'boolean') {
+    return res.status(400).json({ error: 'Invalid live host option' });
+  }
 
   if (!ai) {
     const fallback = isCorrect
@@ -352,7 +347,7 @@ app.post('/api/host-roast', async (req: Request, res: Response) => {
   }
 
   try {
-    const prompt = `You are the legendary, witty, sarcastic game show host of a 1980s themed "You Don't Know Jack" (YDKJ) style live trivia game.
+    const prompt = `You are the witty, quick, warm game show host of an 1980s-themed live trivia party game.
 A player named "${playerName || 'Player'}" just answered a question.
 Current player bank balance: $${score}.
 The question was: "${questionText}".
@@ -371,17 +366,18 @@ Plain text only. No markdown, no stage directions.`;
 
     const roast = response.text?.trim() || (isCorrect ? 'You got it right! Radical!' : 'Wrong! Total bogus blunder!');
 
-    // Generate authentic voice audio for the roast
     let audioBase64: string | undefined;
-    try {
-      audioBase64 = await generateSpeechAudio(
-        roast,
-        isCorrect
-          ? `${DEFAULT_HOST_STYLE} React with genuine delight and a teasing smile.`
-          : `${DEFAULT_HOST_STYLE} React with dry, playful disappointment, never cruel or exaggerated.`
-      );
-    } catch (ttsError) {
-      console.warn('TTS for host roast failed; returning text only:', ttsError);
+    if (!useLiveHost) {
+      try {
+        audioBase64 = await generateSpeechAudio(
+          roast,
+          isCorrect
+            ? `${DEFAULT_HOST_STYLE} React with genuine delight and a teasing smile.`
+            : `${DEFAULT_HOST_STYLE} React with dry, playful disappointment, never cruel or exaggerated.`
+        );
+      } catch (ttsError) {
+        console.warn('TTS for host roast failed; returning text only:', ttsError);
+      }
     }
 
     res.json({ roast, audioBase64 });
@@ -392,6 +388,171 @@ Plain text only. No markdown, no stage directions.`;
       : `Wrong! ${playerName}, that answer was completely bogus. Minus cash for you!`;
     res.json({ roast: fallback });
   }
+});
+
+type LiveSession = Awaited<ReturnType<GoogleGenAI['live']['connect']>>;
+
+function sendLiveEvent(socket: WebSocket, event: Record<string, unknown>) {
+  if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(event));
+}
+
+liveWebSocketServer.on('connection', socket => {
+  let liveSession: LiveSession | null = null;
+  let isStarting = false;
+
+  const startSession = async () => {
+    if (isStarting || liveSession) return;
+    isStarting = true;
+    if (!ai) {
+      sendLiveEvent(socket, { type: 'error', message: 'Live host unavailable: configure GEMINI_API_KEY on the server.' });
+      isStarting = false;
+      return;
+    }
+
+    try {
+      const session = await ai.live.connect({
+        model: LIVE_HOST_MODEL,
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: DEFAULT_HOST_VOICE },
+            },
+          },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          systemInstruction: `You are the funny, sarcastic, quick-witted host of an 1980s trivia party game. Speak briskly, use dry punchlines and playful confidence, and keep teasing friendly rather than cruel. The game controller sends host lines and reactions as text; deliver them naturally. Treat microphone speech as game input, and wait for the controller before judging an answer or announcing a score. Do not invent game state, scores, answers, or rules.`,
+        },
+        callbacks: {
+          onmessage: message => {
+            const content = message.serverContent;
+            if (content?.inputTranscription?.text) {
+              sendLiveEvent(socket, { type: 'input_transcript', text: content.inputTranscription.text });
+            }
+            if (content?.interimInputTranscription?.text) {
+              sendLiveEvent(socket, { type: 'interim_transcript', text: content.interimInputTranscription.text });
+            }
+            if (content?.outputTranscription?.text) {
+              sendLiveEvent(socket, { type: 'output_transcript', text: content.outputTranscription.text });
+            }
+            for (const part of content?.modelTurn?.parts ?? []) {
+              const audio = part.inlineData;
+              if (!audio?.data) continue;
+              const rate = audio.mimeType?.match(/rate=(\d+)/)?.[1];
+              sendLiveEvent(socket, {
+                type: 'audio',
+                data: audio.data,
+                sampleRate: rate ? Number(rate) : 24000,
+              });
+            }
+            if (content?.interrupted) sendLiveEvent(socket, { type: 'interrupted' });
+            if (content?.turnComplete) sendLiveEvent(socket, { type: 'turn_complete' });
+          },
+          onerror: event => {
+            console.error('Gemini Live session error:', event.message);
+            sendLiveEvent(socket, { type: 'error', message: 'The Gemini Live host encountered an error.' });
+            socket.close(1011, 'Gemini Live session error');
+          },
+          onclose: event => {
+            if (socket.readyState === WebSocket.OPEN) {
+              console.warn('Gemini Live session closed:', event.code, event.reason);
+              sendLiveEvent(socket, { type: 'error', message: 'The Gemini Live host disconnected.' });
+              socket.close(1011, 'Gemini Live session closed');
+            }
+          },
+        },
+      });
+      if (socket.readyState !== WebSocket.OPEN) {
+        session.close();
+        return;
+      }
+      liveSession = session;
+      sendLiveEvent(socket, { type: 'ready' });
+    } catch (error) {
+      console.error('Could not connect Gemini Live host:', error);
+      sendLiveEvent(socket, { type: 'error', message: 'Could not connect to Gemini Live. Check the server API key and live model access.' });
+    } finally {
+      isStarting = false;
+    }
+  };
+
+  socket.on('message', (payload, isBinary) => {
+    if (isBinary) {
+      sendLiveEvent(socket, { type: 'error', message: 'Binary client messages are not supported.' });
+      return;
+    }
+
+    let message: { type?: string; data?: string; text?: string };
+    try {
+      message = JSON.parse(payload.toString()) as typeof message;
+    } catch {
+      sendLiveEvent(socket, { type: 'error', message: 'Invalid live voice message.' });
+      return;
+    }
+
+    if (message.type === 'start') {
+      void startSession();
+      return;
+    }
+    if (message.type === 'stop') {
+      liveSession?.close();
+      liveSession = null;
+      return;
+    }
+    if (!liveSession) return;
+
+    if (message.type === 'audio' && typeof message.data === 'string' && message.data.length <= 10000) {
+      liveSession.sendRealtimeInput({
+        audio: { data: message.data, mimeType: 'audio/pcm;rate=16000' },
+      });
+      return;
+    }
+    if (message.type === 'text' && typeof message.text === 'string' && message.text.trim().length <= 1000) {
+      liveSession.sendClientContent({
+        turns: [{ role: 'user', parts: [{ text: message.text.trim() }] }],
+        turnComplete: true,
+      });
+      return;
+    }
+    sendLiveEvent(socket, { type: 'error', message: 'Invalid live voice message.' });
+  });
+
+  socket.on('close', () => {
+    liveSession?.close();
+    liveSession = null;
+  });
+  socket.on('error', error => {
+    console.error('Live voice WebSocket error:', error);
+    liveSession?.close();
+    liveSession = null;
+  });
+});
+
+server.on('upgrade', (request, socket, head) => {
+  const host = request.headers.host;
+  const origin = request.headers.origin;
+  let sameOrigin = false;
+  if (host && origin) {
+    try {
+      sameOrigin = new URL(origin).host === host;
+    } catch {
+      sameOrigin = false;
+    }
+  }
+  let pathname = '';
+  try {
+    pathname = new URL(request.url ?? '/', `http://${host || 'localhost'}`).pathname;
+  } catch {
+    socket.destroy();
+    return;
+  }
+  if (pathname !== '/ws/live' || !sameOrigin) {
+    socket.destroy();
+    return;
+  }
+  liveWebSocketServer.handleUpgrade(request, socket, head, upgradedSocket => {
+    liveWebSocketServer.emit('connection', upgradedSocket, request);
+  });
 });
 
 // Setup Vite or static serving
@@ -409,8 +570,8 @@ async function startServer() {
     });
   }
 
-  app.listen(Number(port), '0.0.0.0', () => {
-    console.log(`[YDKJ 80s Server] Running on http://0.0.0.0:${port}`);
+  server.listen(Number(port), '0.0.0.0', () => {
+    console.log(`[80s Trivia Server] Running on http://0.0.0.0:${port}`);
   });
 }
 

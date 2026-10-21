@@ -1,26 +1,24 @@
 import React, { useEffect } from 'react';
 import { Player } from '../game/types.ts';
 import { getPlayerRank } from '../game/rules.ts';
-import { Trophy, RotateCcw, Sparkles } from 'lucide-react';
+import { Trophy, Sparkles } from 'lucide-react';
 import confetti from 'canvas-confetti';
-import { synth } from '../audio/synthEngine.ts';
+import { media } from '../audio/mediaEngine.ts';
 import { host } from '../audio/speechHost.ts';
 
 interface GameOverViewProps {
   players: Player[];
-  onPlayAgain: () => void;
 }
 
 export const GameOverView: React.FC<GameOverViewProps> = ({
   players,
-  onPlayAgain,
 }) => {
   // Sort players descending by score
   const sorted = [...players].sort((a, b) => b.score - a.score);
   const winner = sorted[0];
 
   useEffect(() => {
-    synth.playFanfare();
+    void media.playEffect('correct');
     confetti({
       particleCount: 120,
       spread: 80,
@@ -116,24 +114,17 @@ export const GameOverView: React.FC<GameOverViewProps> = ({
 
               {/* Stats Footer */}
               <div className="pt-3 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400 font-pixel">
-                <span>BUZZES: {player.buzzCount}</span>
                 <span>CORRECT: {player.correctCount}</span>
-                <span>SCREWS: {1 - player.screwsRemaining}/1 USED</span>
+                <span>FINAL SCORE: ${player.score.toLocaleString()}</span>
               </div>
             </div>
           );
         })}
       </div>
 
-      {/* Restart CTA */}
-      <button
-        data-start="true"
-        onClick={onPlayAgain}
-        className="px-8 py-4 rounded-xl bg-gradient-to-r from-pink-600 via-rose-500 to-yellow-500 hover:from-pink-500 hover:to-yellow-400 text-white font-arcade text-base sm:text-lg tracking-wider shadow-xl shadow-pink-600/30 flex items-center gap-3 transition-all hover:scale-105 active:scale-95 cursor-pointer ring-2 ring-yellow-400"
-      >
-        <RotateCcw className="w-5 h-5" />
-        <span>PLAY ANOTHER SHOW</span>
-      </button>
+      <p className="font-arcade text-xs uppercase tracking-widest text-cyan-300">
+        Say “play again” when you are ready for another round.
+      </p>
     </div>
   );
 };

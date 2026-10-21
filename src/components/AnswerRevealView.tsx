@@ -1,7 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React from 'react';
 import { Question, Player } from '../game/types.ts';
-import { CheckCircle2, XCircle, ArrowRight, Sparkles, Volume2 } from 'lucide-react';
-import { host } from '../audio/speechHost.ts';
+import { CheckCircle2, XCircle, Sparkles, Clock3 } from 'lucide-react';
 
 interface AnswerRevealViewProps {
   question: Question;
@@ -9,8 +8,8 @@ interface AnswerRevealViewProps {
   buzzedPlayer: Player | null;
   pointsChanged: number;
   hostRoastText: string;
-  onNextQuestion: () => void;
   isLastQuestion: boolean;
+  timedOut: boolean;
 }
 
 export const AnswerRevealView: React.FC<AnswerRevealViewProps> = ({
@@ -19,41 +18,27 @@ export const AnswerRevealView: React.FC<AnswerRevealViewProps> = ({
   buzzedPlayer,
   pointsChanged,
   hostRoastText,
-  onNextQuestion,
   isLastQuestion,
+  timedOut,
 }) => {
-  const [countdown, setCountdown] = useState(8);
   const isCorrect = selectedOptionIndex === question.correctIndex;
-  const didTimeExpire = buzzedPlayer === null && selectedOptionIndex === null;
-
-  useEffect(() => {
-    if (countdown <= 0) {
-      onNextQuestion();
-    }
-  }, [countdown, onNextQuestion]);
-
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setCountdown((prev) => Math.max(0, prev - 1));
-    }, 1000);
-
-    return () => clearInterval(timer);
-  }, []);
 
   return (
     <div className="w-full max-w-3xl mx-auto px-4 py-6 flex flex-col gap-6 items-center">
       {/* Result Status Banner */}
       <div
         className={`w-full p-4 sm:p-5 rounded-2xl border-2 flex flex-col sm:flex-row items-center justify-between gap-4 text-center sm:text-left shadow-2xl ${
-          isCorrect
+          timedOut
+            ? 'bg-amber-950/90 border-amber-500 text-amber-200'
+            : isCorrect
             ? 'bg-emerald-950/90 border-emerald-500 text-emerald-200'
-            : didTimeExpire
-            ? 'bg-slate-900 border-slate-700 text-slate-300'
             : 'bg-rose-950/90 border-rose-500 text-rose-200'
         }`}
       >
         <div className="flex items-center gap-3">
-          {isCorrect ? (
+          {timedOut ? (
+            <Clock3 className="w-10 h-10 text-amber-400 shrink-0" />
+          ) : isCorrect ? (
             <CheckCircle2 className="w-10 h-10 text-emerald-400 shrink-0" />
           ) : (
             <XCircle className="w-10 h-10 text-rose-400 shrink-0" />
@@ -61,18 +46,18 @@ export const AnswerRevealView: React.FC<AnswerRevealViewProps> = ({
 
           <div>
             <div className="font-arcade text-lg sm:text-xl">
-              {isCorrect
+              {timedOut
+                ? `${buzzedPlayer?.name.toUpperCase()} RAN OUT OF TIME`
+                : isCorrect
                 ? `${buzzedPlayer?.name.toUpperCase()} NAILED IT!`
-                : didTimeExpire
-                ? 'TIME EXPIRED! NOBODY BUZZED!'
-                : `${buzzedPlayer?.name.toUpperCase()} BLEW IT!`}
+                : `${buzzedPlayer?.name.toUpperCase()} MISSED IT!`}
             </div>
             <div className="text-xs font-sans-retro opacity-90">
-              {isCorrect
-                ? 'Radical deduction! Points added to player bank.'
-                : didTimeExpire
-                ? 'You were all too slow. The 80s wait for no one!'
-                : 'Totally bogus answer! Penalty deducted from player bank.'}
+              {timedOut
+                ? 'No answer locked in. The clock waits for no one.'
+                : isCorrect
+                ? 'Correct answer. Points added to the player score.'
+                : 'Not quite. The host will reveal the right answer.'}
             </div>
           </div>
         </div>
@@ -96,9 +81,6 @@ export const AnswerRevealView: React.FC<AnswerRevealViewProps> = ({
         </div>
 
         <div className="p-4 rounded-xl bg-emerald-950/50 border border-emerald-500/80 flex items-center gap-3">
-          <div className="w-7 h-7 rounded-full bg-emerald-600 text-white font-arcade text-xs flex items-center justify-center shrink-0">
-            {['A', 'B', 'C', 'D'][question.correctIndex]}
-          </div>
           <div className="font-sans-retro text-lg sm:text-xl text-emerald-300 font-bold">
             {question.options[question.correctIndex]}
           </div>
@@ -122,14 +104,9 @@ export const AnswerRevealView: React.FC<AnswerRevealViewProps> = ({
         </div>
       </div>
 
-      {/* Next Question Button */}
-      <button
-        onClick={onNextQuestion}
-        className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-pink-600 via-rose-500 to-yellow-500 hover:from-pink-500 hover:to-yellow-400 text-white font-arcade text-sm sm:text-base tracking-wider shadow-lg flex items-center gap-2 cursor-pointer transition-all hover:scale-105 active:scale-95 ring-2 ring-yellow-400"
-      >
-        <span>{isLastQuestion ? 'PROCEED TO JACK ATTACK FINALE' : `NEXT QUESTION (${countdown}s)`}</span>
-        <ArrowRight className="w-4 h-4" />
-      </button>
+      <p className="text-xs font-arcade uppercase tracking-widest text-cyan-300">
+        {isLastQuestion ? 'Final scores are next...' : `The host is moving on from ${buzzedPlayer?.name || 'that answer'}...`}
+      </p>
     </div>
   );
 };

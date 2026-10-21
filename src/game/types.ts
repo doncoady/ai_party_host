@@ -1,15 +1,4 @@
-export type GameState = 
-  | 'LOBBY' 
-  | 'CATEGORY_SELECT' 
-  | 'SPONSOR_BREAK' 
-  | 'QUESTION_ACTIVE' 
-  | 'PLAYER_BUZZED' 
-  | 'ANSWER_REVEAL' 
-  | 'ROUND_TRANSITION'
-  | 'JACK_ATTACK' 
-  | 'GAME_OVER';
-
-export type QuestionType = 'TRIVIA' | 'SONG_CLIP' | 'SOUND_BYTE' | 'JACK_ATTACK';
+export type QuestionType = 'TRIVIA' | 'SONG_CLIP' | 'SOUND_BYTE';
 
 export interface Player {
   id: string;
@@ -18,11 +7,7 @@ export interface Player {
   color: string;
   borderHex: string;
   bgHex: string;
-  key: string; // Physical keyboard buzzer key e.g. 'q', 'p', 'z', 'm'
-  voiceTriggerWords: string[];
-  avatar: string; // 80s retro emoji/icon
-  screwsRemaining: number;
-  buzzCount: number;
+  avatar: string;
   correctCount: number;
 }
 
@@ -31,12 +16,13 @@ export interface Question {
   category: string;
   title: string;
   question: string;
+  hostClue: string;
   type: QuestionType;
   options: string[];
   correctIndex: number;
   basePoints: number;
   explanation: string;
-  audioClipKey?: string; // Key in synthEngine for song clips
+  audioClipKey?: string;
   soundByteQuote?: string; // 80s movie / character quote
   characterSilhouetteHint?: string;
   hostIntroCommentary: string;
@@ -44,24 +30,4 @@ export interface Question {
   hostWrongRoast: string;
   sponsorTitle?: string;
   sponsorCopy?: string;
-}
-
-export interface JackAttackPair {
-  clue: string;
-  match: string;
-  isCorrect: boolean;
-}
-
-export interface JackAttackRound {
-  topic: string;
-  clueRule: string;
-  pairs: JackAttackPair[];
-}
-
-export interface BuzzerEvent {
-  playerId: string;
-  playerName: string;
-  timestamp: number;
-  viaVoice: boolean;
-  phraseDetected?: string;
 }

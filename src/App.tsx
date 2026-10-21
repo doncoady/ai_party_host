@@ -1,600 +1,418 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { GameState, Player, Question } from './game/types.ts';
-import { TRIVIA_QUESTIONS, JACK_ATTACK_DATA } from './game/triviaData.ts';
-import { 
-  calculateDecayedPoints, 
-  calculatePenalty, 
-  canPlayerBuzz, 
-  executeScrew, 
-  matchVoiceToPlayer, 
-  matchVoiceToOption 
-} from './game/rules.ts';
-import { synth } from './audio/synthEngine.ts';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import type { Player, Question } from './game/types.ts';
+import { TRIVIA_QUESTIONS } from './game/triviaData.ts';
+import { matchVoiceToOption, matchVoiceToPlayerCount } from './game/rules.ts';
 import { host } from './audio/speechHost.ts';
-import { voiceBuzzer } from './speech/voiceBuzzer.ts';
+import { media } from './audio/mediaEngine.ts';
+import { liveVoice } from './speech/liveVoice.ts';
 import { MarqueeHeader } from './components/MarqueeHeader.tsx';
-import { Scoreboard } from './components/Scoreboard.tsx';
-import { LobbyView } from './components/LobbyView.tsx';
 import { TriviaQuestionView } from './components/TriviaQuestionView.tsx';
 import { AnswerRevealView } from './components/AnswerRevealView.tsx';
-import { JackAttackView } from './components/JackAttackView.tsx';
 import { GameOverView } from './components/GameOverView.tsx';
 import { LiveVoiceConsole } from './components/LiveVoiceConsole.tsx';
+import { PlayerSetupView } from './components/PlayerSetupView.tsx';
 
-const DEFAULT_PLAYERS: Player[] = [
-  {
-    id: 'p1',
-    name: 'Neon Nancy',
-    score: 0,
-    color: 'emerald',
-    borderHex: '#10b981',
-    bgHex: '#064e3b',
-    key: 'q',
-    voiceTriggerWords: ['nancy', 'neon', 'green', 'one', 'player 1'],
-    avatar: '🎸',
-    screwsRemaining: 1,
-    buzzCount: 0,
-    correctCount: 0,
-  },
-  {
-    id: 'p2',
-    name: 'Rad Rick',
-    score: 0,
-    color: 'pink',
-    borderHex: '#ec4899',
-    bgHex: '#831843',
-    key: 'p',
-    voiceTriggerWords: ['rick', 'rad', 'pink', 'two', 'player 2'],
-    avatar: '🕶️',
-    screwsRemaining: 1,
-    buzzCount: 0,
-    correctCount: 0,
-  },
+type FlowState = 'PLAYER_COUNT' | 'PLAYER_NAMES' | 'QUESTION_ACTIVE' | 'ANSWER_CONFIRM' | 'ANSWER_REVEAL' | 'GAME_OVER';
+type PlayerColor = Pick<Player, 'color' | 'borderHex' | 'bgHex' | 'avatar'>;
+
+const TURN_SECONDS = 20;
+const CONFIRM_SECONDS = 6;
+const PLAYER_COLORS: PlayerColor[] = [
+  { color: 'emerald', borderHex: '#10b981', bgHex: '#064e3b', avatar: '🎸' },
+  { color: 'pink', borderHex: '#ec4899', bgHex: '#831843', avatar: '🕶️' },
+  { color: 'cyan', borderHex: '#06b6d4', bgHex: '#0e7490', avatar: '🕹️' },
+  { color: 'yellow', borderHex: '#eab308', bgHex: '#a16207', avatar: '📼' },
 ];
 
-export default function App() {
-  const [gameState, setGameState] = useState<GameState>('LOBBY');
-  const [players, setPlayers] = useState<Player[]>(DEFAULT_PLAYERS);
-  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+function createPlayers(count: number): Player[] {
+  return PLAYER_COLORS.slice(0, count).map((style, index) => ({
+    id: `p${index + 1}`,
+    name: '',
+    score: 0,
+    ...style,
+    correctCount: 0,
+  }));
+}
 
-  // Question state
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const [activeBuzzerPlayerId, setActiveBuzzerPlayerId] = useState<string | null>(null);
-  const [lockedOutPlayerIds, setLockedOutPlayerIds] = useState<string[]>([]);
-  const [buzzerSecondsRemaining, setBuzzerSecondsRemaining] = useState(5);
+function spokenName(transcript: string) {
+  return transcript
+    .replace(/^\s*(my name is|i am|i'm|this is)\s+/i, '')
+    .replace(/[.!?,]+$/g, '')
+    .trim()
+    .slice(0, 24);
+}
+
+export default function App() {
+  const [gameState, setGameState] = useState<FlowState>('PLAYER_COUNT');
+  const [players, setPlayers] = useState<Player[]>([]);
+  const [currentPlayerIndex, setCurrentPlayerIndex] = useState(0);
+  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [selectedOptionIndex, setSelectedOptionIndex] = useState<number | null>(null);
+  const [pendingAnswerIndex, setPendingAnswerIndex] = useState<number | null>(null);
   const [pointsChanged, setPointsChanged] = useState(0);
   const [hostRoastText, setHostRoastText] = useState('');
   const [isPlayingAudio, setIsPlayingAudio] = useState(false);
-  const [isProcessingVoice, setIsProcessingVoice] = useState(false);
+  const [isPresentingQuestion, setIsPresentingQuestion] = useState(false);
+  const [secondsRemaining, setSecondsRemaining] = useState<number | null>(null);
+  const [confirmationSecondsRemaining, setConfirmationSecondsRemaining] = useState<number | null>(null);
+  const [turnDeadline, setTurnDeadline] = useState<number | null>(null);
+  const [confirmationDeadline, setConfirmationDeadline] = useState<number | null>(null);
+  const [timedOut, setTimedOut] = useState(false);
+  const hasRemindedPlayer = useRef(false);
+  const answerLocked = useRef(false);
+  const advanceTimer = useRef<number | null>(null);
 
-  // Screw mechanics
-  const [isScrewTargeting, setIsScrewTargeting] = useState(false);
-  const [screwerId, setScrewerId] = useState<string | null>(null);
-  const [isScrewActiveForQuestion, setIsScrewActiveForQuestion] = useState(false);
+  const currentQuestion: Question = TRIVIA_QUESTIONS[currentQuestionIndex] ?? TRIVIA_QUESTIONS[0];
+  const activePlayer = players[currentPlayerIndex] ?? null;
 
-  const QUESTION_DURATION = 16;
-  const currentQuestion: Question = TRIVIA_QUESTIONS[currentQuestionIndex] || TRIVIA_QUESTIONS[0];
-
-  // Sync state to body dataset
   useEffect(() => {
     document.body.dataset.state = gameState.toLowerCase();
   }, [gameState]);
 
-  // Support ?autostart=1
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('autostart') === '1' && gameState === 'LOBBY') {
-      handleStartGame();
-    }
+    let mounted = true;
+    host.prepareForPlayback();
+    void media.toggleBackgroundMusic(true);
+    void liveVoice.start().then(ready => {
+      if (!mounted) return;
+      if (ready) {
+        host.speak('Welcome to the 80s trivia party: where the hair is big and the patience is not. How many players are joining us? Say one, two, three, or four.');
+      } else {
+        host.speak('Welcome to the 80s trivia party. The microphone is not connected yet. Enable live voice, then tell me how many players are joining us.');
+      }
+    });
+    return () => {
+      mounted = false;
+      if (advanceTimer.current !== null) window.clearTimeout(advanceTimer.current);
+      liveVoice.stop();
+    };
   }, []);
 
-  // Calculate current decayed points
-  const currentPoints = calculateDecayedPoints(
-    currentQuestion.basePoints,
-    elapsedSeconds,
-    QUESTION_DURATION
-  );
+  const startTurnClock = useCallback(() => {
+    hasRemindedPlayer.current = false;
+    answerLocked.current = false;
+    setSecondsRemaining(TURN_SECONDS);
+    setTurnDeadline(Date.now() + TURN_SECONDS * 1000);
+  }, []);
 
-  const playQuestionIntroAndAudio = (q: Question) => {
-    host.speak(q.hostIntroCommentary, {
-      voice: 'Kore',
-      onEnd: () => {
-        if (q.type === 'SONG_CLIP' && q.audioClipKey) {
-          setIsPlayingAudio(true);
-          synth.playSongClip(q.audioClipKey, () => setIsPlayingAudio(false));
-        } else if (q.type === 'SOUND_BYTE' && q.soundByteQuote) {
-          setIsPlayingAudio(true);
-          host.playCharacterSoundByte(
-            q.id,
-            q.soundByteQuote,
-            q.characterSilhouetteHint || '',
-            () => setIsPlayingAudio(false)
-          );
-        }
-      },
-    });
-  };
-
-  // Start the Game
-  const handleStartGame = () => {
-    synth.init();
-    synth.playFanfare();
-    voiceBuzzer.start();
+  function askQuestion(question: Question, player: Player) {
     setGameState('QUESTION_ACTIVE');
-    setCurrentQuestionIndex(0);
-    resetQuestionState();
+    setIsPresentingQuestion(true);
+    setSecondsRemaining(null);
+    setTurnDeadline(null);
 
-    // Host intro speech with authentic Gemini voice, followed by automatic song clip
-    playQuestionIntroAndAudio(TRIVIA_QUESTIONS[0]);
-  };
-
-  const resetQuestionState = () => {
-    setElapsedSeconds(0);
-    setActiveBuzzerPlayerId(null);
-    setLockedOutPlayerIds([]);
-    setBuzzerSecondsRemaining(5);
-    setSelectedOptionIndex(null);
-    setPointsChanged(0);
-    setHostRoastText('');
-    setIsPlayingAudio(false);
-    setIsScrewActiveForQuestion(false);
-    setIsScrewTargeting(false);
-    setScrewerId(null);
-  };
-
-  // Question countdown timer
-  useEffect(() => {
-    if (gameState !== 'QUESTION_ACTIVE') return;
-
-    const timer = setInterval(() => {
-      setElapsedSeconds((prev) => {
-        const next = prev + 1;
-        if (next >= QUESTION_DURATION) {
-          clearInterval(timer);
-          handleTimeExpired();
-          return QUESTION_DURATION;
-        }
-        return next;
-      });
-    }, 1000);
-
-    return () => clearInterval(timer);
-  }, [gameState]);
-
-  // Buzzer answer countdown timer (5 seconds once buzzed in)
-  useEffect(() => {
-    if (gameState !== 'PLAYER_BUZZED') return;
-
-    const timer = setInterval(() => {
-      setBuzzerSecondsRemaining((prev) => {
-        if (prev <= 1) {
-          clearInterval(timer);
-          handleBuzzerTimeout();
-          return 0;
-        }
-        synth.playCountdownTick();
-        return prev - 1;
-      });
-    }, 1000);
-
-    return () => clearInterval(timer);
-  }, [gameState, activeBuzzerPlayerId]);
-
-  // Handle Player Buzz In
-  const handlePlayerBuzz = useCallback((playerId: string, viaVoice: boolean = false) => {
-    if (!canPlayerBuzz(playerId, lockedOutPlayerIds, activeBuzzerPlayerId, gameState === 'QUESTION_ACTIVE')) {
-      return;
-    }
-
-    synth.playBuzzer();
-    setActiveBuzzerPlayerId(playerId);
-    setBuzzerSecondsRemaining(5);
-    setGameState('PLAYER_BUZZED');
-
-    const buzzedPlayer = players.find(p => p.id === playerId);
-    if (buzzedPlayer) {
-      setPlayers(prev => prev.map(p => p.id === playerId ? { ...p, buzzCount: p.buzzCount + 1 } : p));
-      host.speak(`${buzzedPlayer.name} buzzed in! Speak your answer now! Five seconds!`, {
-        voice: 'Kore',
-        interrupt: true,
-      });
-    }
-  }, [lockedOutPlayerIds, activeBuzzerPlayerId, gameState, players]);
-
-  // Handle Answer Selection (by voice or click)
-  const handleSelectOption = useCallback(async (optionIndex: number, forcedPlayerId?: string) => {
-    let playerId = forcedPlayerId || activeBuzzerPlayerId;
-
-    // If nobody has buzzed yet during question active, automatically buzz first available player
-    if (!playerId && (gameState === 'QUESTION_ACTIVE' || gameState === 'PLAYER_BUZZED')) {
-      const candidate = players.find(p => !lockedOutPlayerIds.includes(p.id));
-      if (candidate) {
-        playerId = candidate.id;
-        setActiveBuzzerPlayerId(candidate.id);
-        setPlayers(prev => prev.map(p => p.id === candidate.id ? { ...p, buzzCount: p.buzzCount + 1 } : p));
-      }
-    }
-
-    if (!playerId) return;
-
-    setSelectedOptionIndex(optionIndex);
-    const buzzedPlayer = players.find(p => p.id === playerId);
-    if (!buzzedPlayer) return;
-
-    const isCorrect = optionIndex === currentQuestion.correctIndex;
-    const delta = isCorrect ? currentPoints : calculatePenalty(currentPoints);
-
-    setPointsChanged(delta);
-
-    // Update player scores
-    setPlayers(prev =>
-      prev.map(p => {
-        if (p.id === playerId) {
-          return {
-            ...p,
-            score: p.score + delta,
-            correctCount: isCorrect ? p.correctCount + 1 : p.correctCount,
-          };
-        }
-        return p;
-      })
-    );
-
-    if (isCorrect) {
-      synth.playCorrect();
-    } else {
-      synth.playWrong();
-    }
-
-    // Move to Reveal state
-    setGameState('ANSWER_REVEAL');
-
-    // Fetch dynamic AI host roast from server with authentic Gemini TTS audio
-    try {
-      const { roastText, audioBase64 } = await host.fetchDynamicRoast({
-        playerName: buzzedPlayer.name,
-        score: buzzedPlayer.score + delta,
-        questionText: currentQuestion.question,
-        chosenAnswer: currentQuestion.options[optionIndex],
-        isCorrect,
-        correctAnswer: currentQuestion.options[currentQuestion.correctIndex],
-      });
-      setHostRoastText(roastText);
-      if (audioBase64) {
-        host.playAudioWav(audioBase64, undefined, roastText);
-      } else {
-        host.speak(roastText, { voice: 'Kore' });
-      }
-    } catch {
-      const fallback = isCorrect ? currentQuestion.hostCorrectRoast : currentQuestion.hostWrongRoast;
-      setHostRoastText(fallback);
-      host.speak(fallback, { voice: 'Kore' });
-    }
-  }, [gameState, activeBuzzerPlayerId, currentQuestion, currentPoints, players, lockedOutPlayerIds]);
-
-  // Handle Buzzer Timeout (Player failed to answer in 5s)
-  const handleBuzzerTimeout = () => {
-    if (!activeBuzzerPlayerId) return;
-    const buzzedPlayer = players.find(p => p.id === activeBuzzerPlayerId);
-    synth.playWrong();
-
-    const penalty = calculatePenalty(currentPoints);
-    setPointsChanged(penalty);
-
-    setPlayers(prev =>
-      prev.map(p => (p.id === activeBuzzerPlayerId ? { ...p, score: p.score + penalty } : p))
-    );
-
-    // Add to lockouts
-    const newLockouts = [...lockedOutPlayerIds, activeBuzzerPlayerId];
-    setLockedOutPlayerIds(newLockouts);
-
-    // Check if other players can still buzz
-    if (newLockouts.length >= players.length) {
-      setGameState('ANSWER_REVEAL');
-      const roast = `Time expired on ${buzzedPlayer?.name || 'player'}! And nobody else can buzz. Tragic.`;
-      setHostRoastText(roast);
-      host.speak(roast, { voice: 'Kore' });
-    } else {
-      setActiveBuzzerPlayerId(null);
-      setGameState('QUESTION_ACTIVE');
-      host.speak(`Time's up for ${buzzedPlayer?.name}! The floor is open! Anyone shout your name to buzz in!`, {
-        voice: 'Kore',
-        interrupt: true,
-      });
-    }
-  };
-
-  // Handle question time expired without answers
-  const handleTimeExpired = () => {
-    synth.playWrong();
-    setSelectedOptionIndex(null);
-    setActiveBuzzerPlayerId(null);
-    setPointsChanged(0);
-    setGameState('ANSWER_REVEAL');
-    const roast = `Tick tock! Time ran out, and nobody buzzed in. Were you all busy untangling your cassette tapes?!`;
-    setHostRoastText(roast);
-    host.speak(roast, { voice: 'Kore' });
-  };
-
-  // Screw Mechanics
-  const handleInitiateScrew = (screwer: string) => {
-    setIsScrewTargeting(true);
-    setScrewerId(screwer);
-    synth.playScrewStab();
-    host.speak("Someone's feeling ruthless! Shout who you want to screw!", { voice: 'Kore', interrupt: true });
-  };
-
-  const handleSelectScrewTarget = (targetId: string) => {
-    if (!screwerId) return;
-    const res = executeScrew(screwerId, targetId, players);
-    if (!res.success) return;
-
-    setPlayers(res.updatedPlayers);
-    setIsScrewTargeting(false);
-    setIsScrewActiveForQuestion(true);
-
-    const target = players.find(p => p.id === targetId);
-    const screwer = players.find(p => p.id === screwerId);
-
-    synth.playScrewStab();
-    host.speak(`OH SNAP! ${screwer?.name} just SCREWED ${target?.name}! You have five seconds to answer or lose cash!`, {
-      voice: 'Kore',
-      interrupt: true,
-    });
-
-    setActiveBuzzerPlayerId(targetId);
-    setBuzzerSecondsRemaining(5);
-    setGameState('PLAYER_BUZZED');
-  };
-
-  // Play audio clip for song clip / sound byte
-  const handlePlayAudioClip = () => {
-    setIsPlayingAudio(true);
-    if (currentQuestion.type === 'SONG_CLIP' && currentQuestion.audioClipKey) {
-      synth.playSongClip(currentQuestion.audioClipKey, () => {
+    const startClueMedia = () => {
+      const beginAnswering = () => {
         setIsPlayingAudio(false);
-      });
-    } else if (currentQuestion.type === 'SOUND_BYTE') {
-      // Play authentic character voice sound byte via Gemini TTS
-      host.playCharacterSoundByte(
-        currentQuestion.id,
-        currentQuestion.soundByteQuote || '',
-        currentQuestion.characterSilhouetteHint || '',
-        () => setIsPlayingAudio(false)
-      );
-    }
-  };
+        setIsPresentingQuestion(false);
+        startTurnClock();
+      };
 
-  // Next Question or Jack Attack
-  const handleNextQuestion = () => {
-    synth.stopCurrentClip();
-    if (currentQuestionIndex + 1 < TRIVIA_QUESTIONS.length) {
-      const nextIdx = currentQuestionIndex + 1;
-      setCurrentQuestionIndex(nextIdx);
-      resetQuestionState();
-      setGameState('QUESTION_ACTIVE');
-      playQuestionIntroAndAudio(TRIVIA_QUESTIONS[nextIdx]);
-    } else {
-      setGameState('JACK_ATTACK');
-    }
-  };
-
-  // Jack Attack scoring
-  const handlePlayerBuzzJack = (playerId: string, isCorrect: boolean) => {
-    const delta = isCorrect ? 2000 : -2000;
-    setPlayers(prev =>
-      prev.map(p => {
-        if (p.id === playerId) {
-          return {
-            ...p,
-            score: p.score + delta,
-            correctCount: isCorrect ? p.correctCount + 1 : p.correctCount,
-            buzzCount: p.buzzCount + 1,
-          };
-        }
-        return p;
-      })
-    );
-  };
-
-  const handleFinishJackAttack = () => {
-    setGameState('GAME_OVER');
-  };
-
-  const handlePlayAgain = () => {
-    synth.playFanfare();
-    setPlayers(prev =>
-      prev.map(p => ({
-        ...p,
-        score: 0,
-        screwsRemaining: 1,
-        buzzCount: 0,
-        correctCount: 0,
-      }))
-    );
-    setCurrentQuestionIndex(0);
-    resetQuestionState();
-    setGameState('LOBBY');
-  };
-
-  // Central Speech & Live Conversation Handler
-  const handleProcessVoiceInput = useCallback(async (transcript: string) => {
-    if (!transcript || isProcessingVoice) return;
-    const lower = transcript.toLowerCase().trim();
-
-    // 1. Lobby quick voice commands
-    if (gameState === 'LOBBY') {
-      if (/\b(start|play|go|let's play|begin)\b/i.test(lower)) {
-        handleStartGame();
-        return;
-      }
-    }
-
-    // 2. Question Active: Check for immediate player buzz
-    if (gameState === 'QUESTION_ACTIVE') {
-      const matchedPlayer = matchVoiceToPlayer(lower, players);
-      if (matchedPlayer) {
-        handlePlayerBuzz(matchedPlayer.id, true);
-        return;
-      }
-
-      // Check for voice screw command: "Screw Rick" / "Screw Nancy"
-      if (lower.includes('screw')) {
-        for (const target of players) {
-          if (lower.includes(target.name.toLowerCase())) {
-            // Find a player with a screw remaining
-            const screwer = players.find(p => p.id !== target.id && p.screwsRemaining > 0);
-            if (screwer) {
-              setScrewerId(screwer.id);
-              handleSelectScrewTarget(target.id);
-              return;
-            }
-          }
-        }
-      }
-    }
-
-    // 3. Question Active or Player Buzzed: Check for immediate spoken answer
-    if (gameState === 'PLAYER_BUZZED' || gameState === 'QUESTION_ACTIVE') {
-      const matchedOpt = matchVoiceToOption(lower, currentQuestion.options);
-      if (matchedOpt !== null) {
-        handleSelectOption(matchedOpt);
-        return;
-      }
-    }
-
-    // 4. Answer Reveal: Check for voice next command
-    if (gameState === 'ANSWER_REVEAL') {
-      if (/\b(next|continue|move on|go on)\b/i.test(lower)) {
-        handleNextQuestion();
-        return;
-      }
-    }
-
-    // 5. Send to AI Host Live Conversation Engine for deep banter and understanding!
-    setIsProcessingVoice(true);
-    try {
-      const result = await voiceBuzzer.sendLiveConversation({
-        transcript,
-        gameState,
-        players,
-        currentQuestion,
-        activeBuzzerPlayerId,
-      });
-
-      if (result) {
-        // Execute recognized intent
-        if (result.intent === 'BUZZ' && result.playerId) {
-          handlePlayerBuzz(result.playerId, true);
-        } else if (result.intent === 'ANSWER' && typeof result.optionIndex === 'number') {
-          handleSelectOption(result.optionIndex);
-        } else if (result.intent === 'START_GAME' && gameState === 'LOBBY') {
-          handleStartGame();
-        } else if (result.intent === 'NEXT_QUESTION' && gameState === 'ANSWER_REVEAL') {
-          handleNextQuestion();
-        } else if (result.intent === 'SCREW' && result.targetPlayerId) {
-          const screwer = players.find(p => p.id !== result.targetPlayerId && p.screwsRemaining > 0);
-          if (screwer) {
-            setScrewerId(screwer.id);
-            handleSelectScrewTarget(result.targetPlayerId);
-          }
-        }
-
-        // Play host reply audio if generated
-        if (result.audioBase64) {
-          host.playAudioWav(result.audioBase64, undefined, result.hostReplyText);
-        } else if (result.hostReplyText) {
-          host.speak(result.hostReplyText, { voice: 'Kore' });
-        }
-      }
-    } finally {
-      setIsProcessingVoice(false);
-    }
-  }, [gameState, players, currentQuestion, activeBuzzerPlayerId, isProcessingVoice, handlePlayerBuzz, handleSelectOption]);
-
-  // Connect Voice Buzzer callback
-  useEffect(() => {
-    return voiceBuzzer.onBuzzerSpoken((transcript) => {
-      handleProcessVoiceInput(transcript);
-    });
-  }, [handleProcessVoiceInput]);
-
-  // Global Keyboard Listener as backup
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (gameState === 'LOBBY') {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          handleStartGame();
-        }
-        return;
-      }
-
-      if (gameState === 'QUESTION_ACTIVE') {
-        const key = e.key.toLowerCase();
-        const player = players.find(p => p.key === key);
-        if (player) {
-          e.preventDefault();
-          handlePlayerBuzz(player.id);
-        }
-      }
-
-      if (gameState === 'PLAYER_BUZZED' && activeBuzzerPlayerId) {
-        if (['1', '2', '3', '4'].includes(e.key)) {
-          e.preventDefault();
-          handleSelectOption(parseInt(e.key, 10) - 1);
-        }
+      if (question.type === 'SONG_CLIP' && question.audioClipKey) {
+        setIsPlayingAudio(true);
+        void media.playSongClip(question.audioClipKey, beginAnswering, 2);
+      } else if (question.type === 'SOUND_BYTE' && question.soundByteQuote) {
+        setIsPlayingAudio(true);
+        host.speak(`Sound byte: ${question.soundByteQuote}`, {
+          speechStyle: 'Deliver this as a brisk audio clue in a funny, sarcastic game-show-host voice. Do not explain or identify it.',
+          onEnd: beginAnswering,
+        });
+      } else {
+        beginAnswering();
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [gameState, activeBuzzerPlayerId, players, handlePlayerBuzz, handleSelectOption]);
+    host.speak(`${player.name}, you're up. ${question.hostClue}`, {
+      voice: 'Kore',
+      speechStyle: 'A funny, sarcastic, quick-witted 1980s game-show host. Dry punchlines, brisk pace, friendly not cruel.',
+      onEnd: startClueMedia,
+    });
+  }
 
-  const activeBuzzerPlayer = players.find(p => p.id === activeBuzzerPlayerId) || null;
+  const handleNextTurn = useCallback(() => {
+    if (advanceTimer.current !== null) {
+      window.clearTimeout(advanceTimer.current);
+      advanceTimer.current = null;
+    }
+    host.stop();
+    media.stopCurrentClip();
+    setIsPlayingAudio(false);
+    setTurnDeadline(null);
+    setConfirmationDeadline(null);
+    setSecondsRemaining(null);
+    setConfirmationSecondsRemaining(null);
+    if (currentQuestionIndex + 1 >= TRIVIA_QUESTIONS.length) {
+      setGameState('GAME_OVER');
+      media.stopBackgroundMusic();
+      return;
+    }
+
+    const nextPlayerIndex = (currentPlayerIndex + 1) % players.length;
+    const nextQuestionIndex = currentQuestionIndex + 1;
+    setCurrentPlayerIndex(nextPlayerIndex);
+    setCurrentQuestionIndex(nextQuestionIndex);
+    setSelectedOptionIndex(null);
+    setPendingAnswerIndex(null);
+    setPointsChanged(0);
+    setHostRoastText('');
+    setTimedOut(false);
+    setGameState('QUESTION_ACTIVE');
+    askQuestion(TRIVIA_QUESTIONS[nextQuestionIndex], players[nextPlayerIndex]);
+  }, [currentPlayerIndex, currentQuestionIndex, players]);
+
+  const finishAnswer = useCallback((optionIndex: number | null, ranOutOfTime = false) => {
+    if (answerLocked.current || gameState === 'ANSWER_REVEAL' || gameState === 'GAME_OVER') return;
+    answerLocked.current = true;
+    setGameState('ANSWER_REVEAL');
+    setTurnDeadline(null);
+    setConfirmationDeadline(null);
+    setSecondsRemaining(null);
+    setConfirmationSecondsRemaining(null);
+    setPendingAnswerIndex(null);
+    setTimedOut(ranOutOfTime);
+    setSelectedOptionIndex(optionIndex);
+
+    const isCorrect = optionIndex === currentQuestion.correctIndex;
+    const delta = ranOutOfTime ? 0 : isCorrect ? currentQuestion.basePoints : -currentQuestion.basePoints;
+    setPointsChanged(delta);
+    setPlayers(previous => previous.map((player, index) => index === currentPlayerIndex
+      ? {
+          ...player,
+          score: player.score + delta,
+          correctCount: isCorrect ? player.correctCount + 1 : player.correctCount,
+        }
+      : player));
+    void media.playEffect(ranOutOfTime ? 'incorrect' : isCorrect ? 'correct' : 'incorrect');
+
+    const answer = currentQuestion.options[currentQuestion.correctIndex];
+    const resultLine = ranOutOfTime
+      ? `Time's up, ${activePlayer?.name}. The clock wins again. The answer was ${answer}. You can appeal to the clock, but it has no customer service.`
+      : isCorrect
+      ? `${activePlayer?.name}, correct. ${currentQuestion.hostCorrectRoast}`
+      : `Not quite, ${activePlayer?.name}. The answer was ${answer}. ${currentQuestion.hostWrongRoast}`;
+    const nextPlayer = players.length ? players[(currentPlayerIndex + 1) % players.length]?.name : undefined;
+    const nextLine = currentQuestionIndex + 1 >= TRIVIA_QUESTIONS.length
+      ? 'That was the last question. Let us see who survived the decade.'
+      : `Next up: ${nextPlayer || 'the next player'}. Keep it moving.`;
+    const commentary = `${resultLine} ${nextLine}`;
+    setHostRoastText(resultLine);
+
+    let didAdvance = false;
+    const advance = () => {
+      if (didAdvance) return;
+      didAdvance = true;
+      handleNextTurn();
+    };
+    advanceTimer.current = window.setTimeout(advance, 30000);
+    host.speak(commentary, {
+      onEnd: () => {
+        if (advanceTimer.current !== null) window.clearTimeout(advanceTimer.current);
+        advanceTimer.current = window.setTimeout(advance, 500);
+      },
+    });
+  }, [activePlayer, currentPlayerIndex, currentQuestion, currentQuestionIndex, gameState, handleNextTurn, players]);
+
+  const beginGame = useCallback((roster: Player[]) => {
+    setPlayers(roster);
+    setCurrentPlayerIndex(0);
+    setCurrentQuestionIndex(0);
+    setTimedOut(false);
+    setGameState('QUESTION_ACTIVE');
+    askQuestion(TRIVIA_QUESTIONS[0], roster[0]);
+  }, [askQuestion]);
+
+  const handleChoosePlayerCount = useCallback((count: number) => {
+    if (count < 1 || count > 4) return;
+    const roster = createPlayers(count);
+    setPlayers(roster);
+    setCurrentPlayerIndex(0);
+    setGameState('PLAYER_NAMES');
+    host.speak(`Excellent, ${count} ${count === 1 ? 'player' : 'players'}. Player one, say your name or nickname. We have a decade to get through.`);
+  }, []);
+
+  const handleSubmitPlayerName = useCallback((rawName: string) => {
+    const name = spokenName(rawName);
+    if (!name) {
+      host.speak('That sounded like a name trying to escape. Say it again, please.');
+      return;
+    }
+
+    const nextRoster = players.map((player, index) => index === currentPlayerIndex
+      ? { ...player, name }
+      : player);
+    if (currentPlayerIndex + 1 < nextRoster.length) {
+      const nextPlayerIndex = currentPlayerIndex + 1;
+      setPlayers(nextRoster);
+      setCurrentPlayerIndex(nextPlayerIndex);
+      host.speak(`Got it, ${name}. Next player, introduce yourself. Try to make it memorable.`);
+      return;
+    }
+
+    beginGame(nextRoster);
+  }, [beginGame, currentPlayerIndex, players]);
+
+  const handleProcessVoiceInput = useCallback((transcript: string) => {
+    const text = transcript.trim();
+    if (!text) return;
+
+    if (gameState === 'PLAYER_COUNT') {
+      const count = matchVoiceToPlayerCount(text);
+      if (count) handleChoosePlayerCount(count);
+      else host.speak('One, two, three, or four players. This is not a trick question. Yet.');
+      return;
+    }
+
+    if (gameState === 'PLAYER_NAMES') {
+      handleSubmitPlayerName(text);
+      return;
+    }
+
+    if (gameState === 'QUESTION_ACTIVE') {
+      if (isPresentingQuestion || isPlayingAudio || !activePlayer) return;
+      const answerIndex = matchVoiceToOption(text, currentQuestion.options);
+      if (answerIndex === null) {
+        host.speak(`I didn't catch that, ${activePlayer.name}. Give me your answer before the clock files a complaint.`);
+        return;
+      }
+      setPendingAnswerIndex(answerIndex);
+      setGameState('ANSWER_CONFIRM');
+      setConfirmationDeadline(Date.now() + CONFIRM_SECONDS * 1000);
+      setConfirmationSecondsRemaining(CONFIRM_SECONDS);
+      host.speak(`I heard ${currentQuestion.options[answerIndex]}. Is that your final answer, ${activePlayer.name}? Say yes to lock it in, or no to change it.`);
+      return;
+    }
+
+    if (gameState === 'ANSWER_CONFIRM') {
+      if (/\b(yes|yeah|yep|correct|final|lock it in|that's my answer)\b/i.test(text)) {
+        finishAnswer(pendingAnswerIndex);
+      } else if (/\b(no|nope|change|different answer|wait)\b/i.test(text)) {
+        setGameState('QUESTION_ACTIVE');
+        setPendingAnswerIndex(null);
+        setConfirmationDeadline(null);
+        setConfirmationSecondsRemaining(null);
+        setTurnDeadline(Date.now() + Math.max(5, secondsRemaining ?? 5) * 1000);
+        host.speak(`No problem, ${activePlayer?.name}. Think faster this time; the clock is not sentimental.`);
+      }
+      return;
+    }
+
+    if (gameState === 'ANSWER_REVEAL' && /\b(next|continue|go on|move on)\b/i.test(text)) {
+      handleNextTurn();
+      return;
+    }
+
+    if (gameState === 'GAME_OVER' && /\b(play again|another game|restart)\b/i.test(text)) {
+      handlePlayAgain();
+    }
+  }, [
+    activePlayer,
+    currentQuestion.options,
+    finishAnswer,
+    gameState,
+    handleChoosePlayerCount,
+    handleNextTurn,
+    handlePlayAgain,
+    handleSubmitPlayerName,
+    isPlayingAudio,
+    isPresentingQuestion,
+    pendingAnswerIndex,
+    secondsRemaining,
+  ]);
+
+  useEffect(() => liveVoice.onTranscript(handleProcessVoiceInput), [handleProcessVoiceInput]);
+
+  useEffect(() => {
+    if (gameState !== 'QUESTION_ACTIVE' || turnDeadline === null) return;
+    const updateClock = () => {
+      const remaining = Math.max(0, Math.ceil((turnDeadline - Date.now()) / 1000));
+      setSecondsRemaining(remaining);
+      if (remaining > 0 && remaining <= 8 && !hasRemindedPlayer.current) {
+        hasRemindedPlayer.current = true;
+        host.speak(`Clock's ticking, ${activePlayer?.name}. Eight seconds left. Your brain has been warned.`);
+      }
+      if (remaining === 0) finishAnswer(null, true);
+    };
+    updateClock();
+    const timer = window.setInterval(updateClock, 250);
+    return () => window.clearInterval(timer);
+  }, [activePlayer?.name, finishAnswer, gameState, turnDeadline]);
+
+  useEffect(() => {
+    if (gameState !== 'ANSWER_CONFIRM' || confirmationDeadline === null) return;
+    const updateConfirmationClock = () => {
+      const remaining = Math.max(0, Math.ceil((confirmationDeadline - Date.now()) / 1000));
+      setConfirmationSecondsRemaining(remaining);
+      if (remaining === 0) finishAnswer(pendingAnswerIndex);
+    };
+    updateConfirmationClock();
+    const timer = window.setInterval(updateConfirmationClock, 250);
+    return () => window.clearInterval(timer);
+  }, [confirmationDeadline, finishAnswer, gameState, pendingAnswerIndex]);
+
+  function handlePlayAgain() {
+    host.stop();
+    media.stopCurrentClip();
+    void media.toggleBackgroundMusic(true);
+    setPlayers([]);
+    setCurrentQuestionIndex(0);
+    setCurrentPlayerIndex(0);
+    setSelectedOptionIndex(null);
+    setPendingAnswerIndex(null);
+    setConfirmationSecondsRemaining(null);
+    setPointsChanged(0);
+    setHostRoastText('');
+    setTimedOut(false);
+    setGameState('PLAYER_COUNT');
+    host.speak('Round two. How many players are joining us? Say one, two, three, or four.');
+  }
+
+  const voiceInstruction = gameState === 'PLAYER_COUNT'
+    ? 'Say one, two, three, or four players.'
+    : gameState === 'PLAYER_NAMES'
+    ? `Player ${currentPlayerIndex + 1}, say your name.`
+    : gameState === 'QUESTION_ACTIVE'
+    ? `${activePlayer?.name || 'The current player'}: say your answer.`
+    : gameState === 'ANSWER_CONFIRM'
+    ? `Say yes to lock in ${activePlayer?.name || 'your'} answer, or no to change it.`
+    : gameState === 'ANSWER_REVEAL'
+    ? 'The host is moving on. Say next to skip ahead.'
+    : gameState === 'GAME_OVER'
+    ? 'Say play again to start a new game.'
+    : 'Live voice is connecting.';
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-between relative selection:bg-pink-500 selection:text-white">
-      {/* CRT Scanline Retro Overlay */}
       <div className="fixed inset-0 crt-scanlines z-30 pointer-events-none opacity-40" />
 
-      {/* Top Marquee Header */}
       <MarqueeHeader
-        currentRoundName={gameState === 'JACK_ATTACK' ? 'JACK ATTACK' : 'ROUND 1'}
-        questionNumber={currentQuestionIndex + 1}
+        currentRoundName={gameState === 'PLAYER_COUNT' || gameState === 'PLAYER_NAMES' ? 'WELCOME' : '80s TRIVIA'}
+        questionNumber={Math.min(currentQuestionIndex + 1, TRIVIA_QUESTIONS.length)}
         totalQuestions={TRIVIA_QUESTIONS.length}
       />
 
-      {/* Live Voice Interaction Console */}
       <LiveVoiceConsole
-        onDirectSpokenText={handleProcessVoiceInput}
-        activePlayerBuzzedName={activeBuzzerPlayer?.name}
+        activePlayerBuzzedName={gameState === 'QUESTION_ACTIVE' || gameState === 'ANSWER_CONFIRM' ? activePlayer?.name : null}
+        instructionText={voiceInstruction}
       />
 
-      {/* Main Dynamic Viewport */}
       <main className="flex-1 flex flex-col justify-center items-center py-4 relative z-20">
-        {gameState === 'LOBBY' && (
-          <LobbyView
+        {(gameState === 'PLAYER_COUNT' || gameState === 'PLAYER_NAMES') && (
+          <PlayerSetupView
+            step={gameState === 'PLAYER_COUNT' ? 'count' : 'names'}
             players={players}
-            onUpdatePlayers={setPlayers}
-            onStartGame={handleStartGame}
+            currentPlayerIndex={currentPlayerIndex}
           />
         )}
 
-        {(gameState === 'QUESTION_ACTIVE' || gameState === 'PLAYER_BUZZED') && (
+        {(gameState === 'QUESTION_ACTIVE' || gameState === 'ANSWER_CONFIRM') && activePlayer && (
           <TriviaQuestionView
             question={currentQuestion}
-            currentPoints={currentPoints}
-            totalDurationSeconds={QUESTION_DURATION}
-            elapsedSeconds={elapsedSeconds}
-            activeBuzzerPlayer={activeBuzzerPlayer}
-            buzzerSecondsRemaining={buzzerSecondsRemaining}
-            onSelectOption={handleSelectOption}
-            onPlayAudioClip={handlePlayAudioClip}
+            currentPoints={currentQuestion.basePoints}
+            activeBuzzerPlayer={activePlayer}
+            secondsRemaining={gameState === 'ANSWER_CONFIRM' ? confirmationSecondsRemaining : secondsRemaining}
             isPlayingAudio={isPlayingAudio}
-            isScrewTargetActive={isScrewActiveForQuestion}
+            isPresentingQuestion={isPresentingQuestion}
+            isConfirmingAnswer={gameState === 'ANSWER_CONFIRM'}
           />
         )}
 
@@ -602,45 +420,18 @@ export default function App() {
           <AnswerRevealView
             question={currentQuestion}
             selectedOptionIndex={selectedOptionIndex}
-            buzzedPlayer={activeBuzzerPlayer}
+            buzzedPlayer={activePlayer}
             pointsChanged={pointsChanged}
             hostRoastText={hostRoastText}
-            onNextQuestion={handleNextQuestion}
             isLastQuestion={currentQuestionIndex + 1 >= TRIVIA_QUESTIONS.length}
-          />
-        )}
-
-        {gameState === 'JACK_ATTACK' && (
-          <JackAttackView
-            roundData={JACK_ATTACK_DATA}
-            players={players}
-            onPlayerBuzzJack={handlePlayerBuzzJack}
-            onFinishJackAttack={handleFinishJackAttack}
+            timedOut={timedOut}
           />
         )}
 
         {gameState === 'GAME_OVER' && (
-          <GameOverView
-            players={players}
-            onPlayAgain={handlePlayAgain}
-          />
+          <GameOverView players={players} />
         )}
       </main>
-
-      {/* Couch Multiplayer Scoreboard Footer */}
-      {gameState !== 'LOBBY' && gameState !== 'GAME_OVER' && (
-        <Scoreboard
-          players={players}
-          activeBuzzerPlayerId={activeBuzzerPlayerId}
-          lockedOutPlayerIds={lockedOutPlayerIds}
-          isQuestionActive={gameState === 'QUESTION_ACTIVE'}
-          onPlayerBuzz={handlePlayerBuzz}
-          onInitiateScrew={handleInitiateScrew}
-          isScrewTargeting={isScrewTargeting}
-          screwerId={screwerId}
-          onSelectScrewTarget={handleSelectScrewTarget}
-        />
-      )}
     </div>
   );
 }

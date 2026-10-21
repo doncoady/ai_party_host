@@ -257,29 +257,6 @@ class VoiceBuzzerEngine {
     });
   }
 
-  /**
-   * Converse directly with the AI Host in natural language
-   */
-  public async sendLiveConversation(params: {
-    transcript: string;
-    gameState: string;
-    players: any[];
-    currentQuestion?: any;
-    activeBuzzerPlayerId?: string | null;
-  }) {
-    try {
-      const res = await fetch('/api/host-converse', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params),
-      });
-      if (!res.ok) throw new Error('Converse API failed');
-      return await res.json();
-    } catch (err) {
-      console.warn('Live converse error:', err);
-      return null;
-    }
-  }
 }
 
 export const voiceBuzzer = new VoiceBuzzerEngine();

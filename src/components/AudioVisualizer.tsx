@@ -1,5 +1,4 @@
 import React, { useEffect, useRef } from 'react';
-import { synth } from '../audio/synthEngine.ts';
 
 interface AudioVisualizerProps {
   isActive?: boolean;
@@ -29,20 +28,12 @@ export const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
 
       ctx.clearRect(0, 0, width, h);
 
-      const data = synth.getAnalyserData();
       const numBars = 24;
       const barWidth = width / numBars - 2;
 
       for (let i = 0; i < numBars; i++) {
-        let barHeight = 4;
-        if (isActive && data && data.length > 0) {
-          const val = data[i % data.length];
-          barHeight = Math.max(4, (val / 255) * h * 0.95);
-        } else if (isActive) {
-          // Ambient idle wave
-          const t = Date.now() / 300;
-          barHeight = 4 + Math.sin(t + i * 0.4) * 8 + 8;
-        }
+        const t = Date.now() / 300;
+        const barHeight = isActive ? 4 + (Math.sin(t + i * 0.4) + 1) * h * 0.22 : 4;
 
         const x = i * (barWidth + 2);
         const y = h - barHeight;

@@ -1,6 +1,8 @@
-import { voiceBuzzer } from '../speech/voiceBuzzer.ts';
+import { liveVoice } from '../speech/liveVoice.ts';
+import { media } from './mediaEngine.ts';
+import type { Player, Question } from '../game/types.ts';
 
-// Authentic Human AI Host Voice Engine powered by Gemini 3.8 Flash TTS
+// Streams host dialogue with Gemini Live and keeps Gemini TTS as a fallback.
 
 export interface HostSpeechOptions {
   voice?: string;
@@ -15,10 +17,34 @@ class HostEngine {
   private currentSubtitle: string = '';
   private subtitleListeners: Array<(subtitle: string, isSpeaking: boolean) => void> = [];
   private isMuted: boolean = false;
-  private currentAudioElement: HTMLAudioElement | null = null;
+  private audioContext: AudioContext | null = null;
+  private currentAudioSource: AudioBufferSourceNode | null = null;
   private audioCache = new Map<string, string>();
   private speechRequestId = 0;
   private endTimer: number | null = null;
+  private liveOnEnd?: () => void;
+  private lastCompletedLiveTurn = 0;
+
+  constructor() {
+    this.lastCompletedLiveTurn = liveVoice.getState().completedTurns;
+    liveVoice.subscribe(state => {
+      if (state.outputTranscript) {
+        this.notifySubtitles(state.outputTranscript, state.isOutputting);
+      }
+      if (state.completedTurns > this.lastCompletedLiveTurn) {
+        this.lastCompletedLiveTurn = state.completedTurns;
+        this.notifySubtitles('', false);
+        const onEnd = this.liveOnEnd;
+        this.liveOnEnd = undefined;
+        onEnd?.();
+      } else if (!state.isOutputting && !state.outputTranscript && this.currentSubtitle && this.liveOnEnd) {
+        const onEnd = this.liveOnEnd;
+        this.liveOnEnd = undefined;
+        this.notifySubtitles('', false);
+        onEnd();
+      }
+    });
+  }
 
   public setMuted(muted: boolean) {
     this.isMuted = muted;
@@ -41,24 +67,47 @@ class HostEngine {
     };
   }
 
-  private notifySubtitles(subtitle: string, isSpeaking: boolean) {
+  private notifySubtitles(subtitle: string, isSpeaking: boolean, suppressMicrophone = true) {
     this.currentSubtitle = subtitle;
     this.isSpeaking = isSpeaking;
-    voiceBuzzer.setPlaybackSuppressed('host', isSpeaking);
+    liveVoice.setPlaybackSuppressed('host', suppressMicrophone && isSpeaking);
+    media.setMusicDucked(isSpeaking);
     queueMicrotask(() => {
       this.subtitleListeners.forEach(l => l(subtitle, isSpeaking));
     });
   }
 
   private stopCurrentAudio() {
-    if (!this.currentAudioElement) return;
-    this.currentAudioElement.pause();
-    this.currentAudioElement.currentTime = 0;
-    this.currentAudioElement = null;
+    if (this.currentAudioSource) {
+      this.currentAudioSource.onended = null;
+      try {
+        this.currentAudioSource.stop();
+      } catch (err) {
+        if ((err as DOMException).name !== 'InvalidStateError') {
+          console.warn('Unable to stop host audio:', err);
+        }
+      }
+      this.currentAudioSource = null;
+    }
+  }
+
+  public prepareForPlayback() {
+    if (typeof window === 'undefined') return;
+    try {
+      this.audioContext ??= new AudioContext();
+      if (this.audioContext.state === 'suspended') {
+        this.audioContext.resume().catch(err => {
+          console.warn('Could not activate host audio:', err);
+        });
+      }
+    } catch (err) {
+      console.warn('Host Web Audio is unavailable:', err);
+    }
   }
 
   public stop() {
     this.speechRequestId++;
+    this.liveOnEnd = undefined;
     if (this.endTimer !== null) {
       window.clearTimeout(this.endTimer);
       this.endTimer = null;
@@ -70,8 +119,9 @@ class HostEngine {
   /**
    * Play pre-encoded base64 WAV audio (from Gemini TTS)
    */
-  public playAudioWav(base64Data: string, onEnd?: () => void, subtitle = this.currentSubtitle) {
+  public async playAudioWav(base64Data: string, onEnd?: () => void, subtitle = this.currentSubtitle) {
     this.speechRequestId++;
+    const requestId = this.speechRequestId;
     if (this.endTimer !== null) {
       window.clearTimeout(this.endTimer);
       this.endTimer = null;
@@ -83,28 +133,47 @@ class HostEngine {
       return;
     }
 
+    this.prepareForPlayback();
+    this.notifySubtitles(subtitle, true);
+
     try {
-      const audio = new Audio(`data:audio/wav;base64,${base64Data}`);
-      this.currentAudioElement = audio;
-      this.notifySubtitles(subtitle, true);
-      let hasFinished = false;
-      const finish = () => {
-        if (hasFinished) return;
-        hasFinished = true;
-        if (this.currentAudioElement === audio) this.currentAudioElement = null;
+      const context = this.audioContext;
+      if (!context) throw new Error('Host audio context is unavailable');
+
+      const binary = atob(base64Data);
+      const audioBytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+      const buffer = await context.decodeAudioData(audioBytes.buffer);
+      if (requestId !== this.speechRequestId) return;
+      if (context.state === 'suspended') await context.resume();
+      if (requestId !== this.speechRequestId) return;
+
+      const source = context.createBufferSource();
+      source.buffer = buffer;
+      source.connect(context.destination);
+      this.currentAudioSource = source;
+      source.onended = () => {
+        if (requestId !== this.speechRequestId) return;
+        if (this.endTimer !== null) {
+          window.clearTimeout(this.endTimer);
+          this.endTimer = null;
+        }
+        this.currentAudioSource = null;
         this.notifySubtitles('', false);
-        if (onEnd) onEnd();
+        onEnd?.();
       };
-
-      audio.onended = finish;
-      audio.onerror = finish;
-
-      audio.play().catch(() => {
-        finish();
-      });
-    } catch {
+      source.start();
+      this.endTimer = window.setTimeout(() => {
+        if (requestId !== this.speechRequestId) return;
+        this.endTimer = null;
+        this.stopCurrentAudio();
+        this.notifySubtitles('', false);
+        onEnd?.();
+      }, Math.max(3000, Math.min(30000, buffer.duration * 1000 + 2000)));
+    } catch (err) {
+      if (requestId !== this.speechRequestId) return;
+      console.warn('Could not decode or play host audio:', err);
       this.notifySubtitles('', false);
-      if (onEnd) onEnd();
+      onEnd?.();
     }
   }
 
@@ -127,6 +196,11 @@ class HostEngine {
       return;
     }
 
+    if (liveVoice.sendText(trimmed)) {
+      this.liveOnEnd = options.onEnd;
+      this.notifySubtitles(trimmed, true);
+      return;
+    }
     this.notifySubtitles(trimmed, true);
 
     // If pre-supplied audioBase64 exists
@@ -143,10 +217,13 @@ class HostEngine {
     }
 
     // Request authentic voice audio from server
+    const controller = new AbortController();
+    const requestTimeout = window.setTimeout(() => controller.abort(), 12000);
     try {
       const res = await fetch('/api/host-speak', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           text: trimmed,
           voice: options.voice || 'Kore',
@@ -165,19 +242,50 @@ class HostEngine {
     } catch (err) {
       if (requestId !== this.speechRequestId) return;
       console.warn('Gemini TTS failed; showing the host line as text:', err);
+    } finally {
+      window.clearTimeout(requestTimeout);
     }
 
     this.scheduleTextOnlyEnd(trimmed, requestId, options.onEnd);
   }
 
   private scheduleTextOnlyEnd(text: string, requestId: number, onEnd?: () => void) {
-    const duration = Math.max(2000, Math.min(6000, text.length * 60));
+    const duration = 1200;
+    this.notifySubtitles(text, false);
     this.endTimer = window.setTimeout(() => {
       if (requestId !== this.speechRequestId) return;
       this.endTimer = null;
       this.notifySubtitles('', false);
       if (onEnd) onEnd();
     }, duration);
+  }
+
+  public async fetchQuestionNarration(
+    question: Question,
+    players: Player[],
+    isOpening: boolean
+  ): Promise<{ text: string; audioBase64?: string } | null> {
+    try {
+      const res = await fetch('/api/host-narrate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          isOpening,
+          question: {
+            category: question.category,
+            title: question.title,
+            question: question.question,
+            explanation: question.explanation,
+          },
+          players: players.map(({ name, score }) => ({ name, score })),
+        }),
+      });
+      if (!res.ok) throw new Error(`Host narration request failed: ${res.status}`);
+      return await res.json();
+    } catch (err) {
+      console.warn('AI host narration unavailable; using the scripted intro:', err);
+      return null;
+    }
   }
 
   /**
@@ -190,6 +298,7 @@ class HostEngine {
     chosenAnswer: string;
     isCorrect: boolean;
     correctAnswer: string;
+    useLiveHost?: boolean;
   }): Promise<{ roastText: string; audioBase64?: string }> {
     try {
       const res = await fetch('/api/host-roast', {
