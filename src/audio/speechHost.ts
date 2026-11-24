@@ -1,362 +1,419 @@
 import { liveVoice } from '../speech/liveVoice.ts';
+import { voiceInput } from '../speech/voiceInput.ts';
+import { fetchSpeech } from '../services/api.ts';
 import { media } from './mediaEngine.ts';
-import type { Player, Question } from '../game/types.ts';
 
-// Streams host dialogue with Gemini Live and keeps Gemini TTS as a fallback.
-
+/**
+ * Host voice, tuned for an uninterrupted show.
+ *
+ * Scripted lines (the vast majority) climb this ladder:
+ *   1. cached Gemini TTS render (pre-fetched for upcoming turns)  – instant
+ *   2. Gemini Live, if connected                                  – preferred live voice
+ *   3. Gemini TTS fetch, unless it is rate-limited                – a second or two
+ *   4. browser speech synthesis                                   – always available
+ *   5. text subtitles with a reading-time delay
+ * Improvised lines (intro, game over) start at step 2.
+ *
+ * Rate limits (HTTP 429/503) are detected and honoured with a backoff so
+ * prefetching never hammers the API, and every `speak` call gets exactly one
+ * completion, guarded by bounded watchdogs: a live turn that produces no audio
+ * within a few seconds is handed to the next tier instead of stalling the game.
+ */
 export interface HostSpeechOptions {
-  voice?: string;
-  speechStyle?: string;
-  audioBase64?: string; // Pre-generated WAV audio
+  /** Direction for the live host to riff; the text itself is the fallback script. */
+  improv?: string;
+  style?: string;
   onEnd?: () => void;
   interrupt?: boolean;
 }
 
+export type HostTier = 'live' | 'tts' | 'browser' | 'text';
+
+export interface HostSpeechState {
+  subtitle: string;
+  isSpeaking: boolean;
+  tier: HostTier | null;
+  /** Most recent completed line, kept so players can re-read what the host said. */
+  lastLine: string;
+  lastLineAt: number;
+  /** Gemini TTS is backing off after a rate limit (epoch ms until retry). */
+  ttsBackoffUntil: number;
+}
+
+type Listener = (state: HostSpeechState) => void;
+
+/** Reading-time estimate used for watchdogs and the text-only tier. */
+export function estimateSpeechMs(text: string, tier: HostTier) {
+  const words = text.split(/\s+/).filter(Boolean).length;
+  const base = tier === 'text' ? 600 + words * 110 : 1200 + words * 420;
+  return Math.min(tier === 'text' ? 6000 : 30_000, base);
+}
+
+/** How long to wait for the live model to start talking before moving to the next tier. */
+const LIVE_FIRST_AUDIO_MS = 4500;
+const CACHE_LIMIT = 300;
+const PREFETCH_SPACING_MS = 600;
+
 class HostEngine {
-  private isSpeaking: boolean = false;
-  private currentSubtitle: string = '';
-  private subtitleListeners: Array<(subtitle: string, isSpeaking: boolean) => void> = [];
-  private isMuted: boolean = false;
-  private audioContext: AudioContext | null = null;
-  private currentAudioSource: AudioBufferSourceNode | null = null;
+  private state: HostSpeechState = { subtitle: '', isSpeaking: false, tier: null, lastLine: '', lastLineAt: 0, ttsBackoffUntil: 0 };
+  private listeners: Listener[] = [];
+  private muted = false;
+  private requestId = 0;
+  private activeTurnId: number | null = null;
+  private activeOnEnd: (() => void) | null = null;
+  private watchdog: number | null = null;
+  private firstAudioWatchdog: number | null = null;
+  private textTimer: number | null = null;
+  private playback: { stop(): void } | null = null;
+  private utterance: SpeechSynthesisUtterance | null = null;
+  private releaseMicTimer: number | null = null;
+  private queue: Array<{ text: string; options: HostSpeechOptions }> = [];
+  /** Speeds up the text-only tier in tests. */
+  private speedFactor = 1;
+  /** Browser speech synthesis can be disabled (tests, or rooms that dislike the robot voice). */
+  private browserSpeechEnabled = true;
+  /** Rendered speech by line text; filled by prefetch and by first use. */
   private audioCache = new Map<string, string>();
-  private speechRequestId = 0;
-  private endTimer: number | null = null;
-  private liveOnEnd?: () => void;
-  private lastCompletedLiveTurn = 0;
+  private inflight = new Map<string, Promise<string | null>>();
+  private prefetchQueue: string[] = [];
+  private prefetchTimer: number | null = null;
+  private prefetchBusy = false;
 
   constructor() {
-    this.lastCompletedLiveTurn = liveVoice.getState().completedTurns;
+    liveVoice.onTurn(({ turnId }) => {
+      if (turnId !== this.activeTurnId) return;
+      this.finish();
+    });
     liveVoice.subscribe(state => {
-      if (state.outputTranscript) {
-        this.notifySubtitles(state.outputTranscript, state.isOutputting);
-      }
-      if (state.completedTurns > this.lastCompletedLiveTurn) {
-        this.lastCompletedLiveTurn = state.completedTurns;
-        this.notifySubtitles('', false);
-        const onEnd = this.liveOnEnd;
-        this.liveOnEnd = undefined;
-        onEnd?.();
-      } else if (!state.isOutputting && !state.outputTranscript && this.currentSubtitle && this.liveOnEnd) {
-        const onEnd = this.liveOnEnd;
-        this.liveOnEnd = undefined;
-        this.notifySubtitles('', false);
-        onEnd();
-      }
+      if (this.state.tier === 'live' && this.state.isSpeaking && state.outputTranscript) this.setState({ subtitle: state.outputTranscript });
     });
   }
 
-  public setMuted(muted: boolean) {
-    this.isMuted = muted;
-    if (muted) {
-      this.stop();
-    }
+  getState() {
+    return { ...this.state };
   }
 
-  public getMuted(): boolean {
-    return this.isMuted;
-  }
-
-  public subscribe(listener: (subtitle: string, isSpeaking: boolean) => void) {
-    this.subtitleListeners.push(listener);
-    queueMicrotask(() => {
-      listener(this.currentSubtitle, this.isSpeaking);
-    });
+  subscribe(listener: Listener) {
+    this.listeners.push(listener);
+    queueMicrotask(() => listener(this.getState()));
     return () => {
-      this.subtitleListeners = this.subtitleListeners.filter(l => l !== listener);
+      this.listeners = this.listeners.filter(existing => existing !== listener);
     };
   }
 
-  private notifySubtitles(subtitle: string, isSpeaking: boolean, suppressMicrophone = true) {
-    this.currentSubtitle = subtitle;
-    this.isSpeaking = isSpeaking;
-    liveVoice.setPlaybackSuppressed('host', suppressMicrophone && isSpeaking);
-    media.setMusicDucked(isSpeaking);
-    queueMicrotask(() => {
-      this.subtitleListeners.forEach(l => l(subtitle, isSpeaking));
-    });
+  setMuted(muted: boolean) {
+    this.muted = muted;
+    liveVoice.setMuted(muted);
+    if (muted) window.speechSynthesis?.cancel();
   }
 
-  private stopCurrentAudio() {
-    if (this.currentAudioSource) {
-      this.currentAudioSource.onended = null;
-      try {
-        this.currentAudioSource.stop();
-      } catch (err) {
-        if ((err as DOMException).name !== 'InvalidStateError') {
-          console.warn('Unable to stop host audio:', err);
-        }
-      }
-      this.currentAudioSource = null;
-    }
+  getMuted() {
+    return this.muted;
   }
 
-  public prepareForPlayback() {
-    if (typeof window === 'undefined') return;
-    try {
-      this.audioContext ??= new AudioContext();
-      if (this.audioContext.state === 'suspended') {
-        this.audioContext.resume().catch(err => {
-          console.warn('Could not activate host audio:', err);
-        });
-      }
-    } catch (err) {
-      console.warn('Host Web Audio is unavailable:', err);
-    }
+  setSpeedFactor(factor: number) {
+    this.speedFactor = Math.max(0.05, factor);
   }
 
-  public stop() {
-    this.speechRequestId++;
-    this.liveOnEnd = undefined;
-    if (this.endTimer !== null) {
-      window.clearTimeout(this.endTimer);
-      this.endTimer = null;
-    }
-    this.stopCurrentAudio();
-    this.notifySubtitles('', false);
+  setBrowserSpeechEnabled(enabled: boolean) {
+    this.browserSpeechEnabled = enabled;
+  }
+
+  stop() {
+    this.requestId++;
+    this.queue = [];
+    this.activeOnEnd = null;
+    this.activeTurnId = null;
+    this.clearTimers();
+    this.playback?.stop();
+    this.playback = null;
+    this.cancelBrowserSpeech();
+    liveVoice.cancelTurns();
+    this.setState({ subtitle: '', isSpeaking: false, tier: null });
+    this.releaseMic();
   }
 
   /**
-   * Play pre-encoded base64 WAV audio (from Gemini TTS)
+   * Speaks a line. With `interrupt: false` the line waits for the current one
+   * (flow lines never cut the host mid-sentence); otherwise it cuts in.
    */
-  public async playAudioWav(base64Data: string, onEnd?: () => void, subtitle = this.currentSubtitle) {
-    this.speechRequestId++;
-    const requestId = this.speechRequestId;
-    if (this.endTimer !== null) {
-      window.clearTimeout(this.endTimer);
-      this.endTimer = null;
-    }
-    this.stopCurrentAudio();
-    if (this.isMuted) {
-      this.notifySubtitles('', false);
-      if (onEnd) onEnd();
-      return;
-    }
-
-    this.prepareForPlayback();
-    this.notifySubtitles(subtitle, true);
-
-    try {
-      const context = this.audioContext;
-      if (!context) throw new Error('Host audio context is unavailable');
-
-      const binary = atob(base64Data);
-      const audioBytes = Uint8Array.from(binary, character => character.charCodeAt(0));
-      const buffer = await context.decodeAudioData(audioBytes.buffer);
-      if (requestId !== this.speechRequestId) return;
-      if (context.state === 'suspended') await context.resume();
-      if (requestId !== this.speechRequestId) return;
-
-      const source = context.createBufferSource();
-      source.buffer = buffer;
-      source.connect(context.destination);
-      this.currentAudioSource = source;
-      source.onended = () => {
-        if (requestId !== this.speechRequestId) return;
-        if (this.endTimer !== null) {
-          window.clearTimeout(this.endTimer);
-          this.endTimer = null;
-        }
-        this.currentAudioSource = null;
-        this.notifySubtitles('', false);
-        onEnd?.();
-      };
-      source.start();
-      this.endTimer = window.setTimeout(() => {
-        if (requestId !== this.speechRequestId) return;
-        this.endTimer = null;
-        this.stopCurrentAudio();
-        this.notifySubtitles('', false);
-        onEnd?.();
-      }, Math.max(3000, Math.min(30000, buffer.duration * 1000 + 2000)));
-    } catch (err) {
-      if (requestId !== this.speechRequestId) return;
-      console.warn('Could not decode or play host audio:', err);
-      this.notifySubtitles('', false);
-      onEnd?.();
-    }
-  }
-
-  /**
-   * Speak text using the Gemini-generated host voice.
-   */
-  public async speak(text: string, options: HostSpeechOptions = {}) {
-    if (!text || !text.trim()) return;
-
-    if (options.interrupt !== false) {
-      this.stop();
-    }
-    const requestId = ++this.speechRequestId;
-
+  speak(text: string, options: HostSpeechOptions = {}) {
     const trimmed = text.trim();
-
-    if (this.isMuted) {
-      this.notifySubtitles(trimmed, false);
-      this.scheduleTextOnlyEnd(trimmed, requestId, options.onEnd);
+    if (options.interrupt === false && (this.state.isSpeaking || this.queue.length)) {
+      this.queue.push({ text: trimmed, options });
       return;
     }
-
-    if (liveVoice.sendText(trimmed)) {
-      this.liveOnEnd = options.onEnd;
-      this.notifySubtitles(trimmed, true);
-      return;
-    }
-    this.notifySubtitles(trimmed, true);
-
-    // If pre-supplied audioBase64 exists
-    if (options.audioBase64) {
-      this.playAudioWav(options.audioBase64, options.onEnd, trimmed);
-      return;
-    }
-
-    // Check client-side memory cache
-    const cacheKey = trimmed.toLowerCase();
-    if (this.audioCache.has(cacheKey)) {
-      this.playAudioWav(this.audioCache.get(cacheKey)!, options.onEnd, trimmed);
-      return;
-    }
-
-    // Request authentic voice audio from server
-    const controller = new AbortController();
-    const requestTimeout = window.setTimeout(() => controller.abort(), 12000);
-    try {
-      const res = await fetch('/api/host-speak', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          text: trimmed,
-          voice: options.voice || 'Kore',
-          speechStyle: options.speechStyle,
-        }),
-      });
-
-      if (requestId !== this.speechRequestId) return;
-      if (!res.ok) throw new Error('TTS server error');
-      const data = await res.json();
-      if (data.audioBase64) {
-        this.audioCache.set(cacheKey, data.audioBase64);
-        this.playAudioWav(data.audioBase64, options.onEnd, trimmed);
-        return;
-      }
-    } catch (err) {
-      if (requestId !== this.speechRequestId) return;
-      console.warn('Gemini TTS failed; showing the host line as text:', err);
-    } finally {
-      window.clearTimeout(requestTimeout);
-    }
-
-    this.scheduleTextOnlyEnd(trimmed, requestId, options.onEnd);
+    if (options.interrupt !== false) this.stop();
+    this.begin(trimmed, options);
   }
 
-  private scheduleTextOnlyEnd(text: string, requestId: number, onEnd?: () => void) {
-    const duration = 1200;
-    this.notifySubtitles(text, false);
-    this.endTimer = window.setTimeout(() => {
-      if (requestId !== this.speechRequestId) return;
-      this.endTimer = null;
-      this.notifySubtitles('', false);
-      if (onEnd) onEnd();
-    }, duration);
-  }
-
-  public async fetchQuestionNarration(
-    question: Question,
-    players: Player[],
-    isOpening: boolean
-  ): Promise<{ text: string; audioBase64?: string } | null> {
-    try {
-      const res = await fetch('/api/host-narrate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          isOpening,
-          question: {
-            category: question.category,
-            title: question.title,
-            question: question.question,
-            explanation: question.explanation,
-          },
-          players: players.map(({ name, score }) => ({ name, score })),
-        }),
-      });
-      if (!res.ok) throw new Error(`Host narration request failed: ${res.status}`);
-      return await res.json();
-    } catch (err) {
-      console.warn('AI host narration unavailable; using the scripted intro:', err);
-      return null;
+  private begin(trimmed: string, options: HostSpeechOptions) {
+    if (!trimmed) {
+      options.onEnd?.();
+      this.pumpQueue(this.requestId);
+      return;
     }
+    const requestId = ++this.requestId;
+    this.activeOnEnd = options.onEnd ?? null;
+
+    if (this.muted) {
+      this.setState({ subtitle: trimmed, isSpeaking: true, tier: 'text' });
+      this.scheduleTextEnd(trimmed);
+      return;
+    }
+
+    voiceInput.noteHostLine(trimmed, false);
+    this.holdMic();
+    media.duckMusic('host', true);
+    const cached = options.improv ? null : this.audioCache.get(trimmed);
+    if (cached) {
+      void this.playRendered(trimmed, cached, requestId, options);
+      return;
+    }
+    if (this.speakLive(trimmed, options)) return;
+    void this.speakWithTts(trimmed, options, requestId);
   }
 
-  /**
-   * Request dynamic AI host roast/commentary with generated voice audio
-   */
-  public async fetchDynamicRoast(params: {
-    playerName: string;
-    score: number;
-    questionText: string;
-    chosenAnswer: string;
-    isCorrect: boolean;
-    correctAnswer: string;
-    useLiveHost?: boolean;
-  }): Promise<{ roastText: string; audioBase64?: string }> {
+  // ----------------------------------------------------------------- tiers
+  private speakLive(trimmed: string, options: HostSpeechOptions) {
+    const turnId = liveVoice.isReady()
+      ? liveVoice.sendText(options.improv ? `${options.improv}\nScripted fallback: "${trimmed}"` : trimmed, options.improv ? 'improv' : 'say')
+      : null;
+    if (turnId === null) return false;
+    const requestId = this.requestId;
+    this.activeTurnId = turnId;
+    this.setState({ subtitle: trimmed, isSpeaking: true, tier: 'live' });
+    this.armWatchdog(estimateSpeechMs(trimmed, 'live') + 4000);
+    // If the model says nothing for a while, do not wait: take the line down the ladder.
+    this.firstAudioWatchdog = window.setTimeout(() => {
+      this.firstAudioWatchdog = null;
+      if (requestId !== this.requestId || this.activeTurnId !== turnId) return;
+      if (liveVoice.hasOutputFor(turnId)) return;
+      console.warn('Live host did not start speaking; falling back for this line.');
+      this.activeTurnId = null;
+      liveVoice.cancelTurns();
+      void this.speakWithTts(trimmed, { ...options, improv: undefined }, requestId);
+    }, LIVE_FIRST_AUDIO_MS);
+    // Fill the cache for next time without blocking (respects backoff).
+    if (!options.improv) this.prefetch([trimmed]);
+    return true;
+  }
+
+  private async speakWithTts(text: string, options: HostSpeechOptions, requestId: number) {
+    this.setState({ subtitle: text, isSpeaking: true, tier: 'tts' });
+    if (Date.now() < this.state.ttsBackoffUntil) {
+      this.speakWithBrowserOrText(text, requestId);
+      return;
+    }
+    this.armWatchdog(12_000);
+    const audio = await this.fetchAudio(text);
+    if (requestId !== this.requestId) return;
+    if (audio) {
+      await this.playRendered(text, audio, requestId, options);
+      return;
+    }
+    // Rate-limited or down: the live host may have come back meanwhile, else browser speech.
+    if (this.speakLive(text, { ...options, improv: undefined })) return;
+    this.speakWithBrowserOrText(text, requestId);
+  }
+
+  private async playRendered(text: string, audio: string, requestId: number, options: HostSpeechOptions) {
+    void options;
+    this.setState({ subtitle: text, isSpeaking: true, tier: 'tts' });
+    const playback = media.playEncodedAudio(audio, 'voice');
+    this.playback = playback;
+    this.armWatchdog(estimateSpeechMs(text, 'tts') + 4000);
+    const result = await playback.done;
+    if (requestId !== this.requestId) return;
+    if (result === 'failed') {
+      this.speakWithBrowserOrText(text, requestId);
+      return;
+    }
+    this.finish();
+  }
+
+  private speakWithBrowserOrText(text: string, requestId: number) {
+    if (requestId !== this.requestId) return;
+    if (this.speakWithBrowser(text, requestId)) return;
+    this.setState({ tier: 'text' });
+    this.scheduleTextEnd(text);
+  }
+
+  /** Browser speech synthesis: no network, no quota, always there. */
+  private speakWithBrowser(text: string, requestId: number) {
+    const synth = typeof window !== 'undefined' ? window.speechSynthesis : undefined;
+    if (!this.browserSpeechEnabled || !synth || typeof SpeechSynthesisUtterance === 'undefined') return false;
     try {
-      const res = await fetch('/api/host-roast', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params),
-      });
-      if (!res.ok) throw new Error('API failed');
-      const data = await res.json();
-      return {
-        roastText: data.roast,
-        audioBase64: data.audioBase64,
+      const voices = synth.getVoices();
+      if (!voices.length) return false;
+      synth.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1.05;
+      utterance.pitch = 1;
+      const preferred = voices.find(voice => /en[-_]/i.test(voice.lang) && /google|natural|premium|enhanced/i.test(voice.name)) ?? voices.find(voice => /en[-_]/i.test(voice.lang));
+      if (preferred) utterance.voice = preferred;
+      utterance.onend = () => {
+        if (requestId !== this.requestId) return;
+        this.utterance = null;
+        this.finish();
       };
+      utterance.onerror = () => {
+        if (requestId !== this.requestId) return;
+        this.utterance = null;
+        this.setState({ tier: 'text' });
+        this.scheduleTextEnd(text);
+      };
+      this.utterance = utterance;
+      this.setState({ subtitle: text, isSpeaking: true, tier: 'browser' });
+      this.armWatchdog(estimateSpeechMs(text, 'browser') + 4000);
+      synth.speak(utterance);
+      return true;
     } catch {
-      const fallbacks = params.isCorrect
-        ? [
-            `Boom! ${params.playerName} nails it! You must have spent your entire allowance on arcade tokens.`,
-            `Bingo! Look at you, a certified 80s cultural artifact!`,
-          ]
-        : [
-            `Oof! Incorrect, ${params.playerName}! That answer was so bad, MTV canceled music videos again.`,
-            `Wrong! ${params.playerName}, that was totally bogus! Minus cash for you.`,
-          ];
-      const text = fallbacks[Math.floor(Math.random() * fallbacks.length)];
-      return { roastText: text };
+      return false;
     }
   }
 
-  /**
-   * Play character sound byte (Doc Brown, Terminator, Ferris Bueller, etc.)
-   */
-  public async playCharacterSoundByte(quoteKey: string, text: string, character: string, onEnd?: () => void) {
-    this.stop();
-    const requestId = ++this.speechRequestId;
-    this.notifySubtitles(`"${text}"`, true);
-    try {
-      const res = await fetch('/api/character-quote', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ quoteKey, text, character }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (requestId !== this.speechRequestId) return;
-        if (data.audioBase64) {
-          this.playAudioWav(data.audioBase64, onEnd, `"${text}"`);
-          return;
-        }
-      }
-    } catch (err) {
-      if (requestId !== this.speechRequestId) return;
-      console.warn('Character quote API failed, falling back:', err);
-    }
+  private cancelBrowserSpeech() {
+    if (!this.utterance) return;
+    this.utterance.onend = null;
+    this.utterance.onerror = null;
+    this.utterance = null;
+    window.speechSynthesis?.cancel();
+  }
 
-    // Fallback speak
-    if (requestId === this.speechRequestId) {
-      this.speak(text, { onEnd, interrupt: false });
+  // ---------------------------------------------------------------- cache
+  /** Pre-renders lines the game is likely to say next. Cheap to call often; rate-aware. */
+  prefetch(texts: string[]) {
+    if (this.muted) return;
+    for (const text of texts) {
+      const key = text.trim();
+      if (!key || this.audioCache.has(key) || this.inflight.has(key) || this.prefetchQueue.includes(key)) continue;
+      this.prefetchQueue.push(key);
     }
+    this.pumpPrefetch();
+  }
+
+  private pumpPrefetch() {
+    if (this.prefetchBusy || this.prefetchTimer !== null || !this.prefetchQueue.length) return;
+    const wait = Math.max(0, this.state.ttsBackoffUntil - Date.now());
+    this.prefetchTimer = window.setTimeout(() => {
+      this.prefetchTimer = null;
+      const key = this.prefetchQueue.shift();
+      if (!key) return;
+      this.prefetchBusy = true;
+      void this.fetchAudio(key).finally(() => {
+        this.prefetchBusy = false;
+        this.prefetchTimer = window.setTimeout(() => {
+          this.prefetchTimer = null;
+          this.pumpPrefetch();
+        }, PREFETCH_SPACING_MS);
+      });
+    }, wait);
+  }
+
+  private fetchAudio(key: string): Promise<string | null> {
+    const cached = this.audioCache.get(key);
+    if (cached) return Promise.resolve(cached);
+    const existing = this.inflight.get(key);
+    if (existing) return existing;
+    if (Date.now() < this.state.ttsBackoffUntil) return Promise.resolve(null);
+    const request = fetchSpeech(key).then(result => {
+      if (result.audio) {
+        this.remember(key, result.audio);
+        return result.audio;
+      }
+      // 429 = quota; 503 = not configured/down. Back off accordingly so prefetch and play stop asking.
+      const seconds = result.retryAfterSeconds ?? (result.status === 429 ? 30 : result.status === 503 ? 120 : result.status === 0 ? 20 : 60);
+      this.setState({ ttsBackoffUntil: Date.now() + seconds * 1000 });
+      if (result.status === 429) console.warn(`Gemini TTS rate limit hit; backing off for ${seconds} s (live host / browser speech will cover).`);
+      return null;
+    }).finally(() => this.inflight.delete(key));
+    this.inflight.set(key, request);
+    return request;
+  }
+
+  private remember(key: string, audio: string) {
+    if (this.audioCache.size >= CACHE_LIMIT) {
+      const oldest = this.audioCache.keys().next().value;
+      if (oldest !== undefined) this.audioCache.delete(oldest);
+    }
+    this.audioCache.set(key, audio);
+    if (this.state.ttsBackoffUntil) this.setState({ ttsBackoffUntil: 0 });
+  }
+
+  // ----------------------------------------------------------- completion
+  private scheduleTextEnd(text: string) {
+    this.clearTimers();
+    const delay = estimateSpeechMs(text, 'text') * this.speedFactor;
+    this.textTimer = window.setTimeout(() => {
+      this.textTimer = null;
+      this.finish();
+    }, delay);
+  }
+
+  private armWatchdog(ms: number) {
+    if (this.watchdog !== null) window.clearTimeout(this.watchdog);
+    this.watchdog = window.setTimeout(() => {
+      this.watchdog = null;
+      console.warn('Host speech watchdog fired; continuing the game.');
+      this.finish();
+    }, ms);
+  }
+
+  private finish() {
+    const onEnd = this.activeOnEnd;
+    this.activeOnEnd = null;
+    this.activeTurnId = null;
+    this.clearTimers();
+    this.playback = null;
+    this.utterance = null;
+    media.duckMusic('host', false);
+    if (this.state.subtitle) voiceInput.noteHostLine(this.state.subtitle, true);
+    this.setState({ subtitle: '', isSpeaking: false, tier: null, lastLine: this.state.subtitle || this.state.lastLine, lastLineAt: Date.now() });
+    this.releaseMic();
+    const before = this.requestId;
+    onEnd?.();
+    this.pumpQueue(before);
+  }
+
+  /** Continue with queued lines unless the completion handler started something new. */
+  private pumpQueue(before: number) {
+    if (this.requestId === before && !this.state.isSpeaking && this.queue.length) {
+      const next = this.queue.shift()!;
+      this.begin(next.text, next.options);
+    }
+  }
+
+  private clearTimers() {
+    if (this.watchdog !== null) window.clearTimeout(this.watchdog);
+    if (this.firstAudioWatchdog !== null) window.clearTimeout(this.firstAudioWatchdog);
+    if (this.textTimer !== null) window.clearTimeout(this.textTimer);
+    this.watchdog = null;
+    this.firstAudioWatchdog = null;
+    this.textTimer = null;
+  }
+
+  private holdMic() {
+    if (this.releaseMicTimer !== null) {
+      window.clearTimeout(this.releaseMicTimer);
+      this.releaseMicTimer = null;
+    }
+    voiceInput.setPlaybackSuppressed('host', true);
+  }
+
+  /** Keeps the mic muted briefly after the host stops so room echo is not transcribed. */
+  private releaseMic() {
+    if (this.releaseMicTimer !== null) window.clearTimeout(this.releaseMicTimer);
+    this.releaseMicTimer = window.setTimeout(() => {
+      this.releaseMicTimer = null;
+      voiceInput.setPlaybackSuppressed('host', false);
+    }, 600);
+  }
+
+  private setState(changes: Partial<HostSpeechState>) {
+    this.state = { ...this.state, ...changes };
+    const snapshot = this.getState();
+    queueMicrotask(() => this.listeners.forEach(listener => listener(snapshot)));
   }
 }
 

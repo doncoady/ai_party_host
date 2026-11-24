@@ -1,11 +1,19 @@
 Background music
-“Monkeys Spinning Monkeys” by Kevin MacLeod
+"Monkeys Spinning Monkeys" by Kevin MacLeod
 https://incompetech.com/music/royalty-free/index.html?isrc=USUAN1100185
 Licensed under Creative Commons Attribution 4.0:
 https://creativecommons.org/licenses/by/4.0/
 
-Sound effects
+Game-show sound effects (sfx/*.ogg, sfx/*.mp3 except click_001.ogg)
+Synthesized for this project by scripts/generate-sfx.py (numpy + ffmpeg).
+Released under CC0 1.0 Universal; regenerate with `npm run sfx`.
+
+UI click (sfx/click_001.ogg)
 Kenney, Interface Sounds asset pack
 https://kenney.nl/assets/interface-sounds
 CC0 1.0 Universal:
 https://creativecommons.org/publicdomain/zero/1.0/
+
+Song excerpts and sound bites
+Fetched on demand by the clip pipeline (yt-dlp, iTunes previews, MyInstants) and
+cached locally; they are not distributed with the application.

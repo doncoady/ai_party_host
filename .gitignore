@@ -6,3 +6,9 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# local caches and test output
+.cache/
+.cache-e2e/
+test-results/
+playwright-report/

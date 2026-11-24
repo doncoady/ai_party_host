@@ -8,11 +8,18 @@
   },
   "scripts": {
     "dev": "tsx server.ts",
-    "start": "tsx server.ts",
+    "dev:mock": "PARTY_HOST_MODE=mock tsx server.ts",
+    "start": "NODE_ENV=production tsx server.ts",
     "build": "vite build",
-    "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; for (const path of ['dist', 'server.js']) rmSync(path, { recursive: true, force: true });\"",
+    "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; for (const path of ['dist', '.cache-e2e', 'test-results', 'playwright-report']) rmSync(path, { recursive: true, force: true });\"",
     "lint": "tsc --noEmit",
-    "test": "tsx --test src/game/rules.test.ts src/speech/voiceBuzzer.test.ts"
+    "test": "tsx --test src/**/*.test.ts server/**/*.test.ts server/*.test.ts",
+    "test:e2e": "playwright test --project core",
+    "test:e2e:ui": "playwright test --ui",
+    "test:all": "npm run lint && npm test && npm run test:e2e",
+    "sfx": "python3 scripts/generate-sfx.py",
+    "prebuild-packs": "tsx scripts/prebuild-packs.ts",
+    "test:e2e:all": "playwright test"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -30,6 +37,7 @@
     "ws": "^8.22.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.0",
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "@types/react": "^19.3.0",

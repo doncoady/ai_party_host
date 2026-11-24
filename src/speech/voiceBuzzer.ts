@@ -1,4 +1,4 @@
-// Real-time Continuous Voice Interaction Engine (Web Speech API + Live AI Host Conversation)
+// Browser Web Speech API recogniser: the fallback transport when Gemini Live is unavailable (see voiceInput.ts).
 
 export interface VoiceRecognitionState {
   isListening: boolean;
