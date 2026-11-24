@@ -52,7 +52,7 @@ export async function chooseSegment(source: SourceResult, request: ClipRequest, 
   }
 
   // Previews are already the hook region; a local loudness scan finds the chorus in well under a second.
-  const useGemini = config.clipAnalysis === 'gemini' || (config.clipAnalysis === 'auto' && !source.isExcerpt);
+  const useGemini = source.provider !== 'mock' && (config.clipAnalysis === 'gemini' || (config.clipAnalysis === 'auto' && !source.isExcerpt));
   const gemini = useGemini
     ? await analyseWithGemini(source, request, workDir, total, target).catch(error => {
         console.warn(`[clips] Gemini analysis failed for "${request.query}":`, error instanceof Error ? error.message : error);

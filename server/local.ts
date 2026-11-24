@@ -204,11 +204,13 @@ export class LocalLibrary {
   private indexing: Promise<void> | null = null;
   private readonly envFile: string;
   private readonly indexFile: string;
+  private readonly autoEnrich: boolean;
   private listeners: Array<() => void> = [];
 
-  constructor(cacheDir = config.cacheDir, envFile = ENV_FILE) {
+  constructor(cacheDir = config.cacheDir, envFile = ENV_FILE, options: { autoEnrich?: boolean } = {}) {
     this.envFile = envFile;
     this.indexFile = join(cacheDir, 'local-index.json');
+    this.autoEnrich = options.autoEnrich ?? true;
   }
 
   /** Loads the persisted index and starts a (re)scan of the folder from .env. */
@@ -290,7 +292,9 @@ export class LocalLibrary {
         const index: IndexFile = { version: 3, songs: this.songs, indexedAt: Date.now() };
         await writeFile(this.indexFile, JSON.stringify(index));
         if (this.songs.length) console.log(`[local] indexed ${this.songs.length} songs in ${this.settings.localSongsDir} (themes: ${this.impliedThemes().join(', ') || 'none'})`);
-        if (this.songs.some(track => !track.enrichedAt)) setTimeout(() => void this.enrichFromCatalog().catch(() => undefined), 500);
+        if (this.autoEnrich && this.songs.some(track => !track.enrichedAt)) {
+          setTimeout(() => void this.enrichFromCatalog().catch(() => undefined), 500).unref();
+        }
       } catch (error) {
         console.warn('[local] indexing failed:', error instanceof Error ? error.message : error);
       } finally {

@@ -90,6 +90,10 @@ export function createApp() {
   });
 
   app.put('/api/settings', async (req, res) => {
+    const ip = req.ip ?? req.socket?.remoteAddress ?? '';
+    if (ip !== '127.0.0.1' && ip !== '::1' && ip !== '::ffff:127.0.0.1') {
+      return res.status(403).json({ error: 'Media settings can only be changed from the host machine' });
+    }
     const { localSongsDir, preferLocal } = req.body ?? {};
     if ((localSongsDir !== undefined && (typeof localSongsDir !== 'string' || localSongsDir.length > 500))
       || (preferLocal !== undefined && typeof preferLocal !== 'boolean')) {

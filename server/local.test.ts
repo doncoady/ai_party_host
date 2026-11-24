@@ -42,7 +42,7 @@ test('the library indexes the configured folder, persists it to .env, and infers
     }
     await writeFile(join(root, 'songs', 'Oasis - Wonderwall.mp3'), 'x');
     const envFile = join(root, '.env');
-    const library = new LocalLibrary(join(root, 'cache'), envFile);
+    const library = new LocalLibrary(join(root, 'cache'), envFile, { autoEnrich: false });
     await library.updateSettings({ localSongsDir: join(root, 'songs'), preferLocal: true });
     const status = library.status();
     assert.equal(status.songs, 5);
